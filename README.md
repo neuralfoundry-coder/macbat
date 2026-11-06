@@ -12,6 +12,8 @@ One small native binary, no dependencies, a clean terminal UI with [themes](#the
 - **Fan control** — see every fan's speed, min / max and mode; pin a fixed speed (`sudo macbat fan set 3000` or `50%`) or go back to automatic (`sudo macbat fan auto`). Speeds are always kept inside the fan's own min..max — fans are never stopped — and a thermal guard hands control back to the SMC if the CPU reaches 90 °C.
 - **Battery status** — charge, mode, adapter, health, cycles, voltage / current / power, temperature, time left, fan speed.
 - **Settings screen** — run `macbat` and change everything with the arrow keys: charge limit, fan speed, screen-off-when-idle, brightness, keyboard backlight, lid / power button / idle sleep, disk power saving, Wi-Fi / USB / CPU / PCIe power saving, theme. Changes apply immediately and survive reboots.
+- **Menu bar app (macOS)** — *MacBat.app*: battery level and state in the menu bar, a panel with the charge limit, auto-discharge, top-up, energy mode and fans, in English and Korean. See [below](#menu-bar-app-macos).
+- **Top up once** — `sudo macbat topup` charges to 100 % one time (before a trip), then the limit applies again.
 - **Themes** — `modern` (default), `mono`, `ocean`, `candy`, `nord`, and the classic `retro` / `amber` CRT looks; truecolor where the terminal has it, 256 or 16 colours otherwise (the Linux console included), none with `NO_COLOR`.
 
 ![macbat settings screen](docs/linux-tui.svg)
@@ -30,17 +32,18 @@ One line, needs only `sh` and `curl` (or `wget`) — the right binary for your O
 curl -fsSL https://raw.githubusercontent.com/neuralfoundry-coder/macbat/main/install.sh | sudo sh
 ```
 
-It installs `/usr/local/bin/macbat` and starts the background service (limit 80 %, auto-discharge on).
+It installs `/usr/local/bin/macbat` and starts the background service (limit 80 %, auto-discharge on). On macOS it also installs the menu bar app as `/Applications/MacBat.app` and starts it (`MACBAT_NO_APP=1` skips the app).
 
 - Check first without changing anything: `curl -fsSL …/install.sh | MACBAT_DRY_RUN=1 sh`
-- Specific version: `… | sudo MACBAT_VERSION=0.5.0 sh`
+- Specific version: `… | sudo MACBAT_VERSION=0.6.0 sh`
 
 **Packages** (from the [releases page](https://github.com/neuralfoundry-coder/macbat/releases)):
 
 | | |
 |---|---|
-| Ubuntu / Debian (Intel Mac) | `sudo apt install ./macbat_0.5.0_amd64.deb` |
-| macOS | `macbat-0.5.0-macos-universal.pkg` — unsigned: right-click → Open, or `sudo installer -pkg macbat-0.5.0-macos-universal.pkg -target /` |
+| Ubuntu / Debian (Intel Mac) | `sudo apt install ./macbat_0.6.0_amd64.deb` |
+| macOS | `macbat-0.6.0-macos-universal.pkg` — the command-line tool and MacBat.app. The package itself is not signed (right-click → Open, or `sudo installer -pkg macbat-0.6.0-macos-universal.pkg -target /`); the app and the tool inside are Developer ID signed and notarized |
+| macOS, app only | `MacBat-app.zip` — unzip into `/Applications` |
 
 **From source:** `make && sudo ./macbat install` (Linux needs a C compiler; macOS needs the Xcode command line tools).
 
@@ -53,6 +56,7 @@ It installs `/usr/local/bin/macbat` and starts the background service (limit 80 
 | `sudo macbat limit 80` | charge limit 20–100 (`off` = 100) |
 | `sudo macbat discharge on\|off` | auto-discharge down to the limit while plugged in |
 | `sudo macbat restore` | resume charging, re-enable the adapter and give the fans back to automatic control, right now |
+| `sudo macbat topup` | charge to 100 % once, then back to the limit (`topup off` cancels; the service ends it at 100 % or after 12 h) |
 | `macbat fan` | fan page — speed, min / max, target, mode (`--plain` / `--json` too) |
 | `sudo macbat fan set 3000` | fixed fan speed in RPM, clamped to the fan's min..max |
 | `sudo macbat fan set 50%` | fixed speed as a share of the fan's range (0 % = min, 100 % = max) |
@@ -89,7 +93,32 @@ interval=30       # seconds between checks
 screen_blank=600  # set from the settings screen
 fan=auto          # auto, an RPM (3000) or a share of the fan's range (50%) - set with `macbat fan`
 theme=ocean       # optional; without it the default theme (modern) is used
+topup=on          # only while `macbat topup` runs (with topup_since); the service removes it
 ```
+
+## Menu bar app (macOS)
+
+<p>
+<img src="docs/menubar-en-light.png" width="340" alt="MacBat in the menu bar and its four state icons">&nbsp;
+<img src="docs/menubar-ko-dark.png" width="340" alt="MacBat 메뉴 막대 아이콘 (한국어, 다크 모드)">
+</p>
+<p>
+<img src="docs/panel-en-dark.png" width="340" alt="MacBat panel, English, dark">&nbsp;
+<img src="docs/panel-ko-light.png" width="340" alt="MacBat 패널, 한국어, 라이트">
+</p>
+
+*Rendered by MacBat itself (`MacBat --render-snapshots DIR`) with live data from an M4 Max — where AlDente manages charging, so MacBat says so and keeps every control read-only. English and Korean follow the system language.*
+
+**In the menu bar**: a template battery icon (follows light / dark) with the charge level, a bolt while charging, a pause mark while held at the limit and an arrow while auto-discharging; the percentage can be turned off.
+**The panel**: big charge %, state (charging / holding at 80 % / discharging to the limit / on battery), time left, a gauge with the limit marked; charge-limit slider (20–100 %, steps of 5), auto-discharge, energy mode (or Low Power Mode on older macOS), *Top up to 100 % once*; time remaining, power source and adapter watts, health, cycles, temperature, voltage / current; fans with *Auto* / *Fixed* and a speed slider; *Settings in Terminal* opens the full `macbat` settings screen. The accent colour follows the macbat theme. MacBat starts at login (toggle in the ⋯ menu, via `SMAppService`), needs macOS 13 or later and runs on Apple Silicon and Intel.
+
+**Privileges.** Reading never needs root: MacBat runs `macbat status --json` as you. Changes go to the root `macbat` service over a Unix socket, `/var/run/macbat.sock`, which is created owned by root with mode 0660 and group `admin`; for every connection the service checks the peer's credentials again and only accepts root or an **admin user who is logged in at the screen**. Only a fixed list of requests is accepted (`limit 85`, `discharge on`, `topup on`, `fan set 3000`, `powermode 1`, …), every value is validated and every request is logged. When the service is not running, MacBat runs the same `macbat` command through the standard *administrator password* prompt instead. Nothing is ever world-writable.
+
+**Other battery tools**: when AlDente or Battery Toolkit runs, MacBat shows it and stays read-only. *Take over…* (with a confirmation) lets it change charging anyway for the current session — both tools would then write the same SMC keys.
+
+**Signing**: MacBat.app and the `macbat` tool are signed with a Developer ID (hardened runtime) and notarized, the ticket is stapled to the app. The one-line installer downloads with `curl`, which does not quarantine files, so nothing has to be approved. The `.pkg` is not signed (no Developer ID *Installer* certificate yet): open it with right-click → Open.
+
+Not tested on real hardware yet: writes from the app (the control socket and the password prompt on macOS) — the only Apple Silicon Mac available runs AlDente and stays read-only. The socket protocol itself was tested with the Linux build of the same code.
 
 ## Themes
 
@@ -125,6 +154,7 @@ macbat talks to the System Management Controller directly and only uses keys it 
 
 - **Linux**: reads go through the `applesmc` driver. Writes use the SMC I/O ports (0x300/0x304) with the same protocol as the kernel driver; while writing, macbat briefly stops `mbpfan` and unloads `applesmc` so nothing else talks to the SMC, then reloads it, restarts `mbpfan` and verifies the value. Writes only happen when something changes. Requires kernel lockdown to be off (the default on Macs, which do not Secure-Boot Linux).
 - **macOS**: uses the `AppleSMC` IOKit user client and IOKit sleep notifications.
+- **Control socket**: the service listens on `/var/run/macbat.sock` (macOS) or `/run/macbat.sock` (Linux): root-owned, mode 0660, group `admin` (macOS) or `sudo` / `admin` / `wheel` (Linux), peer credentials checked per connection (macOS also requires the user at the screen). One line in (`limit 80`), one line out (`ok …` / `err …`); used by MacBat.app, available to scripts: `printf 'limit 85\n' | nc -U /run/macbat.sock`.
 
 ### Fan control
 
@@ -157,8 +187,8 @@ These SMC keys are undocumented. Behaviour was verified on the machines below; u
 
 | Machine | OS | What was verified |
 |---|---|---|
-| MacBookPro12,1 (13" 2015) | Ubuntu 24.04, kernel 6.8 | everything: `BCLM` limit, `ACEN` auto-discharge, service start/stop/restore, sleep hook, `.deb` install/remove, settings screen (brightness, keyboard backlight, blanking, ALPM, turbo via TLP); 0.4.0 fan control: `fan set` / `fan auto`, clamping to the minimum, mbpfan pause / resume, service re-applying the speed after `restore` and after a restart |
-| Mac16,5 (M4 Max) | macOS 26.5 | status, SMC reads, fan reads, settings screen (read-only), AlDente detection; `CHTE` / `CHIE` writes verified with the 0.1 prototype; fan writes **not** tested |
+| MacBookPro12,1 (13" 2015) | Ubuntu 24.04, kernel 6.8 | 0.6.0: control socket (access rules, validation, `limit` / `discharge` / `topup` / `fan` requests), `topup` (BCLM 80 → 100 → 80); everything: `BCLM` limit, `ACEN` auto-discharge, service start/stop/restore, sleep hook, `.deb` install/remove, settings screen (brightness, keyboard backlight, blanking, ALPM, turbo via TLP); 0.4.0 fan control: `fan set` / `fan auto`, clamping to the minimum, mbpfan pause / resume, service re-applying the speed after `restore` and after a restart |
+| Mac16,5 (M4 Max) | macOS 26.5 | status, SMC reads, fan reads, settings screen (read-only), AlDente detection, MacBat.app (read-only: panel, menu bar icon, English / Korean); `CHTE` / `CHIE` writes verified with the 0.1 prototype; fan writes and app writes **not** tested |
 
 Intel Macs running macOS: implemented but not tested — reports welcome. Not yet exercised on real hardware: the thermal guard tripping at 90 °C, and fan behaviour across suspend / resume.
 
@@ -180,12 +210,15 @@ macbat fan        # 팬 화면 (속도, 최소/최대, 모드)
 sudo macbat fan set 3000   # 팬 고정 속도 (RPM 또는 50% 같은 비율, 최소~최대 범위로 제한)
 sudo macbat fan auto       # 자동 팬 제어로 복귀
 macbat theme --list        # 테마 미리 보기 (저장: sudo macbat theme ocean)
+sudo macbat topup          # 한 번만 100%까지 충전
 ```
 
 - **충전 제한**: 인텔 맥 리눅스는 SMC 하드웨어 제한(`BCLM`), Apple Silicon은 충전 중지(`CHTE`)
 - **자동 방전**: 제한보다 3% 이상 높으면 어댑터를 우회해서, 꽂아 둔 채로 제한치까지 방전
 - **팬 제어**: 팬 속도·최소/최대·모드 표시, 고정 속도 설정과 자동 복귀. 항상 팬의 최소~최대 범위 안에서만 설정하고(팬을 끌 수 없음), CPU가 90 °C에 닿으면 자동 제어로 돌려 줍니다. 리눅스에서 mbpfan이 돌고 있으면 고정 속도를 요청할 때만 멈추고(비활성화), `fan auto`로 다시 켭니다. macOS 팬 쓰기는 실험 기능입니다.
 - **테마**: 기본은 깔끔한 `modern`. `mono`(색 없음), `ocean`, `candy`, `nord`, 예전 레트로 화면인 `retro`/`amber`도 있습니다. `macbat theme --list`로 전부 미리 보고, `sudo macbat theme 이름`으로 저장(`/etc/macbat.conf`의 `theme=`), 한 번만 쓰려면 `macbat --theme 이름 status` 또는 `MACBAT_THEME=이름`. 설정 화면의 *Theme* 줄에서 ←→로 바로 미리 볼 수 있습니다(저장은 sudo). 터미널에 맞춰 트루컬러 → 256색 → 16색(리눅스 콘솔)으로 자동으로 낮추고, `NO_COLOR`가 있으면 색을 쓰지 않습니다.
+- **메뉴 막대 앱(macOS)**: `MacBat.app` — 메뉴 막대에 배터리 잔량과 상태(충전 중 번개, 제한에서 유지 일시정지, 자동 방전 화살표)를 보여 주고, 패널에서 충전 제한 슬라이더, 자동 방전, 한 번만 100% 충전, 에너지 모드, 팬(자동/고정)을 바꿀 수 있습니다. 시스템 언어에 따라 한국어/영어로 표시되고 로그인할 때 자동으로 실행됩니다(⋯ 메뉴에서 끌 수 있음). 읽기는 일반 사용자 권한으로 하고, 변경은 root 서비스의 소켓(`/var/run/macbat.sock`, root 소유·0660·admin 그룹, 연결마다 "화면에 로그인한 관리자"인지 다시 확인)으로 보내며, 서비스가 없으면 표준 관리자 암호 창으로 같은 `macbat` 명령을 실행합니다. AlDente가 돌고 있으면 그 사실을 표시하고 읽기 전용으로 동작합니다. 앱과 명령줄 도구는 Developer ID로 서명·공증되어 있습니다.
+- **한 번만 100% 충전**: `sudo macbat topup` — 여행 전 등에 한 번만 100%까지 충전하고 다시 제한으로 돌아갑니다(`topup off`로 취소).
 - **설정 화면**: 충전 제한, 팬 속도, 테마, 입력 없을 때 화면 끄기, 밝기, 키보드 백라이트, 덮개 / 전원 버튼 / 유휴 잠자기, 디스크 절전(ALPM, 스핀다운), Wi-Fi / USB / CPU / PCIe 절전. 바로 적용되고 재부팅 후에도 유지됩니다(TLP가 있으면 TLP 설정으로 저장).
 - **안전장치**: 서비스가 멈추거나 잠자기에 들어가면 정상 충전과 자동 팬 제어로 복구합니다. 10% 이하에서는 충전을 막지 않습니다. AlDente가 실행 중이면 충전 설정에 손대지 않습니다.
 
