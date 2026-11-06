@@ -1,20 +1,21 @@
 # macbat
 
 **Battery charge limiter, fan control, battery status and power settings for Apple laptops** — Intel MacBooks running Linux, and macOS (Apple Silicon / Intel).
-One small native binary, no dependencies, retro green-screen UI.
+One small native binary, no dependencies, a clean terminal UI with [themes](#themes) — the retro green screen included.
 
 ![macbat status on a MacBook Pro 2015 running Ubuntu](docs/linux-status.svg)
-*`macbat status` on a MacBook Pro 2015 (MacBookPro12,1) with Ubuntu 24.04: charge limit 80 % held by the SMC (`BCLM`), the fan driven by mbpfan.*
+*`macbat status` in the default `modern` theme on a MacBook Pro 2015 (MacBookPro12,1) with Ubuntu 24.04: charge limit 80 % held by the SMC (`BCLM`), the fan driven by mbpfan.*
 
 - **Charge limit** — keep the battery at e.g. 80 % to slow down wear.
   Linux / Intel Macs use the SMC's own hardware limit (`BCLM`); Apple Silicon pauses charging through the SMC (`CHTE`).
 - **Auto-discharge** — when the battery is 3 % or more above the limit, macbat bypasses the AC adapter so the battery drains down to the limit *while plugged in*, then hands power back to the adapter.
 - **Fan control** — see every fan's speed, min / max and mode; pin a fixed speed (`sudo macbat fan set 3000` or `50%`) or go back to automatic (`sudo macbat fan auto`). Speeds are always kept inside the fan's own min..max — fans are never stopped — and a thermal guard hands control back to the SMC if the CPU reaches 90 °C.
 - **Battery status** — charge, mode, adapter, health, cycles, voltage / current / power, temperature, time left, fan speed.
-- **Settings screen** — run `macbat` and change everything with the arrow keys: charge limit, fan speed, screen-off-when-idle, brightness, keyboard backlight, lid / power button / idle sleep, disk power saving, Wi-Fi / USB / CPU / PCIe power saving. Changes apply immediately and survive reboots.
+- **Settings screen** — run `macbat` and change everything with the arrow keys: charge limit, fan speed, screen-off-when-idle, brightness, keyboard backlight, lid / power button / idle sleep, disk power saving, Wi-Fi / USB / CPU / PCIe power saving, theme. Changes apply immediately and survive reboots.
+- **Themes** — `modern` (default), `mono`, `ocean`, `candy`, `nord`, and the classic `retro` / `amber` CRT looks; truecolor where the terminal has it, 256 or 16 colours otherwise (the Linux console included), none with `NO_COLOR`.
 
 ![macbat settings screen](docs/linux-tui.svg)
-*`macbat` (no arguments) opens the settings screen — shown here read-only, as a normal user; run it with `sudo` (or press **S**) to change values.*
+*`macbat` (no arguments) opens the settings screen — shown here read-only, as a normal user; run it with `sudo` (or press **S**) to change values. The *Theme* row previews every theme live, even without `sudo`.*
 
 ![macbat fan page](docs/linux-fan.svg)
 *`macbat fan`: live fan speed against the fan's min..max range, who controls it, and the CPU temperature.*
@@ -32,14 +33,14 @@ curl -fsSL https://raw.githubusercontent.com/neuralfoundry-coder/macbat/main/ins
 It installs `/usr/local/bin/macbat` and starts the background service (limit 80 %, auto-discharge on).
 
 - Check first without changing anything: `curl -fsSL …/install.sh | MACBAT_DRY_RUN=1 sh`
-- Specific version: `… | sudo MACBAT_VERSION=0.4.0 sh`
+- Specific version: `… | sudo MACBAT_VERSION=0.5.0 sh`
 
 **Packages** (from the [releases page](https://github.com/neuralfoundry-coder/macbat/releases)):
 
 | | |
 |---|---|
-| Ubuntu / Debian (Intel Mac) | `sudo apt install ./macbat_0.4.0_amd64.deb` |
-| macOS | `macbat-0.4.0-macos-universal.pkg` — unsigned: right-click → Open, or `sudo installer -pkg macbat-0.4.0-macos-universal.pkg -target /` |
+| Ubuntu / Debian (Intel Mac) | `sudo apt install ./macbat_0.5.0_amd64.deb` |
+| macOS | `macbat-0.5.0-macos-universal.pkg` — unsigned: right-click → Open, or `sudo installer -pkg macbat-0.5.0-macos-universal.pkg -target /` |
 
 **From source:** `make && sudo ./macbat install` (Linux needs a C compiler; macOS needs the Xcode command line tools).
 
@@ -57,10 +58,12 @@ It installs `/usr/local/bin/macbat` and starts the background service (limit 80 
 | `sudo macbat fan set 50%` | fixed speed as a share of the fan's range (0 % = min, 100 % = max) |
 | `sudo macbat fan auto` | automatic fan control again (SMC, or mbpfan if macbat paused it) |
 | `sudo macbat install` / `uninstall` | add / remove the service (uninstall restores 100 % and normal charging) |
+| `macbat theme` | current theme and the list; `macbat theme --list` previews them all |
+| `sudo macbat theme ocean` | save a theme in `/etc/macbat.conf` (`sudo macbat theme default` goes back to `modern`) |
+| `macbat --theme NAME …` | use a theme just for this command, e.g. `macbat --theme retro status` |
 | `macbat keys` | the relevant SMC keys (diagnostics) |
 
 Settings screen keys: **↑ ↓** select · **← →** change · **Enter** apply / run · **R** refresh · **Q** quit.
-Colours: `MACBAT_THEME=amber` for an amber screen, `NO_COLOR=1` for none.
 
 ### What the settings screen controls
 
@@ -68,6 +71,7 @@ Colours: `MACBAT_THEME=amber` for an amber screen, `NO_COLOR=1` for none.
 |---|---|---|
 | Battery | charge limit, auto-discharge, resume charging now | same |
 | Fans | fan speed: AUTO or 0–100 % of the fan's range, with the live RPM | same (experimental) |
+| Appearance | theme, with live preview (preview works without `sudo`; saving needs it) | same |
 | Display | screen off when idle (console blanking), display brightness, keyboard backlight | display sleep |
 | Sleep | lid close, power button, sleep when idle (systemd-logind) | system sleep, Power Nap, low power mode |
 | Disk | SATA link power management (ALPM), disk spin-down (rotational disks) | disk sleep |
@@ -84,7 +88,30 @@ hysteresis=3      # band: auto-discharge starts at limit+3 %; software limit (Ap
 interval=30       # seconds between checks
 screen_blank=600  # set from the settings screen
 fan=auto          # auto, an RPM (3000) or a share of the fan's range (50%) - set with `macbat fan`
+theme=ocean       # optional; without it the default theme (modern) is used
 ```
+
+## Themes
+
+The look of `macbat status`, `macbat fan` and the settings screen. `--plain` and `--json` output never changes.
+
+| | |
+|---|---|
+| ![modern theme, light terminal](docs/theme-modern-light.svg)<br>**modern** (default) — rounded frame, slim gauge, one blue accent; reads on light and dark terminals (dark: see the top of this page) | ![mono theme](docs/theme-mono.svg)<br>**mono** — no colour at all; what every theme turns into with `NO_COLOR` |
+| ![ocean theme](docs/theme-ocean.svg)<br>**ocean** — deep blue frame, aqua accents, gradient gauge | ![candy theme](docs/theme-candy.svg)<br>**candy** — pastel pink and lavender, dotted gauge |
+| ![nord theme](docs/theme-nord.svg)<br>**nord** — the arctic Nord palette, square frame | ![modern theme on the Linux console](docs/theme-console.svg)<br>**modern on the Linux console** — `TERM=linux` (fbterm / VT) gets 16 colours |
+| ![retro theme](docs/theme-retro.svg)<br>**retro** — the green CRT look of macbat 0.3 / 0.4: double frame, block digits | ![amber theme](docs/theme-amber.svg)<br>**amber** — the same CRT layout in amber |
+
+**Choosing one** — the first that is set wins:
+
+1. `--theme NAME` on the command line (`macbat --theme candy status`)
+2. the `MACBAT_THEME` environment variable (`MACBAT_THEME=green` still means `retro`)
+3. `theme=` in `/etc/macbat.conf` — set it with `sudo macbat theme NAME`, or on the settings screen (*Appearance → Theme*: ← → previews live; with `sudo` the choice is saved)
+4. the default, `modern`
+
+`macbat theme --list` draws a preview of every theme; an unknown name stops with the list of themes.
+
+**Colours** follow the terminal: truecolor when `COLORTERM=truecolor` (or `24bit`), 256 colours when `TERM` says so, 16 colours on the Linux console (`TERM=linux`) and anything else, and none when `NO_COLOR` is set. `MACBAT_COLORS=16|256|truecolor|none` overrides the detection. All themes use only glyphs that the Linux console's Terminus font has.
 
 ## How it works
 
@@ -143,7 +170,7 @@ macbat is free and MIT-licensed. If it keeps your battery (or your ears) happy, 
 
 ## 한국어 요약
 
-Apple 노트북용 **배터리 충전 제한 · 배터리 상태 · 전원 설정** 도구입니다. 의존성 없는 네이티브 실행 파일 하나이고, 레트로 그린 스크린 UI를 씁니다.
+Apple 노트북용 **배터리 충전 제한 · 팬 제어 · 배터리 상태 · 전원 설정** 도구입니다. 의존성 없는 네이티브 실행 파일 하나이고, 테마를 고를 수 있는 깔끔한 터미널 UI를 씁니다(레트로 그린 스크린 포함).
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/neuralfoundry-coder/macbat/main/install.sh | sudo sh   # 설치 + 서비스 시작
@@ -152,12 +179,14 @@ macbat status     # 상태 화면
 macbat fan        # 팬 화면 (속도, 최소/최대, 모드)
 sudo macbat fan set 3000   # 팬 고정 속도 (RPM 또는 50% 같은 비율, 최소~최대 범위로 제한)
 sudo macbat fan auto       # 자동 팬 제어로 복귀
+macbat theme --list        # 테마 미리 보기 (저장: sudo macbat theme ocean)
 ```
 
 - **충전 제한**: 인텔 맥 리눅스는 SMC 하드웨어 제한(`BCLM`), Apple Silicon은 충전 중지(`CHTE`)
 - **자동 방전**: 제한보다 3% 이상 높으면 어댑터를 우회해서, 꽂아 둔 채로 제한치까지 방전
 - **팬 제어**: 팬 속도·최소/최대·모드 표시, 고정 속도 설정과 자동 복귀. 항상 팬의 최소~최대 범위 안에서만 설정하고(팬을 끌 수 없음), CPU가 90 °C에 닿으면 자동 제어로 돌려 줍니다. 리눅스에서 mbpfan이 돌고 있으면 고정 속도를 요청할 때만 멈추고(비활성화), `fan auto`로 다시 켭니다. macOS 팬 쓰기는 실험 기능입니다.
-- **설정 화면**: 충전 제한, 팬 속도, 입력 없을 때 화면 끄기, 밝기, 키보드 백라이트, 덮개 / 전원 버튼 / 유휴 잠자기, 디스크 절전(ALPM, 스핀다운), Wi-Fi / USB / CPU / PCIe 절전. 바로 적용되고 재부팅 후에도 유지됩니다(TLP가 있으면 TLP 설정으로 저장).
+- **테마**: 기본은 깔끔한 `modern`. `mono`(색 없음), `ocean`, `candy`, `nord`, 예전 레트로 화면인 `retro`/`amber`도 있습니다. `macbat theme --list`로 전부 미리 보고, `sudo macbat theme 이름`으로 저장(`/etc/macbat.conf`의 `theme=`), 한 번만 쓰려면 `macbat --theme 이름 status` 또는 `MACBAT_THEME=이름`. 설정 화면의 *Theme* 줄에서 ←→로 바로 미리 볼 수 있습니다(저장은 sudo). 터미널에 맞춰 트루컬러 → 256색 → 16색(리눅스 콘솔)으로 자동으로 낮추고, `NO_COLOR`가 있으면 색을 쓰지 않습니다.
+- **설정 화면**: 충전 제한, 팬 속도, 테마, 입력 없을 때 화면 끄기, 밝기, 키보드 백라이트, 덮개 / 전원 버튼 / 유휴 잠자기, 디스크 절전(ALPM, 스핀다운), Wi-Fi / USB / CPU / PCIe 절전. 바로 적용되고 재부팅 후에도 유지됩니다(TLP가 있으면 TLP 설정으로 저장).
 - **안전장치**: 서비스가 멈추거나 잠자기에 들어가면 정상 충전과 자동 팬 제어로 복구합니다. 10% 이하에서는 충전을 막지 않습니다. AlDente가 실행 중이면 충전 설정에 손대지 않습니다.
 
 비공개 SMC 키를 사용하므로 위 표의 기기에서 검증된 동작이며, 사용 책임은 사용자에게 있습니다.
