@@ -15,7 +15,8 @@ cat > "$w/scripts/postinstall" <<'PI'
 exit 0
 PI
 chmod 755 "$w/scripts/postinstall"
-pkgbuild --quiet --root "$w/root" --scripts "$w/scripts" --identifier com.neuralfoundry.macbat \
+xattr -cr "$w/root" "$w/scripts"                       # no AppleDouble ._ files in the payload
+COPYFILE_DISABLE=1 pkgbuild --quiet --root "$w/root" --scripts "$w/scripts" --identifier com.neuralfoundry.macbat \
          --version "$VERSION" --install-location / "dist/macbat-$VERSION-macos-universal.pkg"
 rm -rf "$w"
 ls -l dist/macbat-macos-universal "dist/macbat-$VERSION-macos-universal.pkg"
