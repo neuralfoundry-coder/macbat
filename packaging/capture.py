@@ -25,8 +25,7 @@ out, start, sent = b"", time.time(), not keys
 while True:
     if not sent and time.time() - start >= delay:
         os.write(fd, keys); sent = True
-    if time.time() - start > delay + 30:          # safety net: never leave the command running
-        os.kill(pid, signal.SIGTERM); break
+    if time.time() - start > delay + 30: break     # safety net: never leave the command running (see below)
     try:
         r, _, _ = select.select([fd], [], [], 0.2 if not sent else 3)
         if not r:
@@ -36,5 +35,16 @@ while True:
         if not d: break
         out += d
     except OSError: break
-os.waitpid(pid, 0)
+if os.waitpid(pid, os.WNOHANG)[0] == 0:            # still running: stop it, but keep reading the pty -
+    os.kill(pid, signal.SIGTERM)                   # a TUI restoring the terminal blocks until its output is read
+    end = time.time() + 5
+    while time.time() < end and os.waitpid(pid, os.WNOHANG)[0] == 0:
+        try:
+            r, _, _ = select.select([fd], [], [], 0.2)
+            if r: out += os.read(fd, 65536)
+        except OSError: break
+    else:
+        if time.time() >= end: os.kill(pid, signal.SIGKILL)
+    try: os.waitpid(pid, 0)
+    except ChildProcessError: pass
 (sys.stdout.buffer if args[0] == "-" else open(args[0], "wb")).write(out)
