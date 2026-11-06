@@ -4,11 +4,12 @@
  *   Linux on Intel Macs (applesmc): hardware limit via SMC BCLM, auto-discharge via ACEN / CH0I
  *   macOS on Apple Silicon:         limit via CHTE (or CH0B/CH0C), auto-discharge via CHIE / CH0I
  *   macOS on Intel:                 BCLM / CH0I (experimental)
+ *   fans: applesmc sysfs on Linux, SMC F<n>Ac/Mn/Mx/Tg/Md + FS! on macOS
  *
  * Single file, no dependencies.  Build:  make   (see Makefile)
  * SPDX-License-Identifier: MIT
  */
-#define MACBAT_VERSION "0.3.0"
+#define MACBAT_VERSION "0.4.0"
 
 #include <ctype.h>
 #include <errno.h>
@@ -129,6 +130,15 @@ static bool write_text(const char *path, const char *text, mode_t mode) {
     return rename(tmp, path) == 0;
 }
 
+__attribute__((unused)) static bool write_file(const char *path, const char *val) {
+    int fd = open(path, O_WRONLY | O_NOCTTY);
+    if (fd < 0) return false;
+    size_t len = strlen(val);
+    ssize_t n = write(fd, val, len);
+    close(fd);
+    return n == (ssize_t)len;
+}
+
 static long iround(double x) { return x < 0 ? -(long)(-x + 0.5) : (long)(x + 0.5); }
 __attribute__((unused)) static double dabs(double x) { return x < 0 ? -x : x; }
 
@@ -211,6 +221,9 @@ typedef struct {
     int limit; bool auto_discharge; int hysteresis; int interval;
     int screen_blank; /* seconds, -1 = leave alone */
     char sata_alpm[32], wifi_ps[8], usb_as[8], cpu_gov[32], cpu_turbo[8], aspm[32], spindown[8];
+    char fan[16];          /* "auto", "<rpm>" or "<n>%" of the fan's min..max range */
+    char fan_paused[32];   /* fan daemon (mbpfan) that macbat stopped for a manual speed */
+    bool fan_paused_enabled;
 } conf_t;
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
@@ -219,6 +232,7 @@ static conf_t load_conf(void) {
     conf_t c;
     memset(&c, 0, sizeof c);
     c.limit = 80; c.auto_discharge = true; c.hysteresis = 3; c.interval = 30; c.screen_blank = -1;
+    snprintf(c.fan, sizeof c.fan, "auto");
     FILE *f = fopen(CONF_PATH, "r");
     if (f) {
         char line[256];
@@ -238,7 +252,9 @@ static conf_t load_conf(void) {
             else if (!strcmp(k, "interval")) c.interval = atoi(v);
 #define CS(name) else if (!strcmp(k, #name)) snprintf(c.name, sizeof c.name, "%s", v)
             CS(sata_alpm); CS(wifi_ps); CS(usb_as); CS(cpu_gov); CS(cpu_turbo); CS(aspm); CS(spindown);
+            CS(fan); CS(fan_paused);
 #undef CS
+            else if (!strcmp(k, "fan_paused_enabled")) c.fan_paused_enabled = !strcasecmp(v, "on");
             else if (!strcmp(k, "screen_blank")) c.screen_blank = *v ? atoi(v) : -1;
             else if (!strcmp(k, "auto_discharge"))
                 c.auto_discharge = !strcasecmp(v, "on") || !strcasecmp(v, "1") || !strcasecmp(v, "yes") || !strcasecmp(v, "true");
@@ -248,6 +264,7 @@ static conf_t load_conf(void) {
     c.limit = clampi(c.limit, 20, 100);
     c.hysteresis = clampi(c.hysteresis, 1, 20);
     c.interval = clampi(c.interval, 5, 600);
+    if (!*c.fan) snprintf(c.fan, sizeof c.fan, "auto");
     return c;
 }
 
@@ -261,6 +278,12 @@ static void save_conf(conf_t c) {
 #define CS(name) if (*c.name) { snprintf(t, sizeof t, #name "=%s\n", c.name); strcat(b, t); }
     CS(sata_alpm) CS(wifi_ps) CS(usb_as) CS(cpu_gov) CS(cpu_turbo) CS(aspm) CS(spindown)
 #undef CS
+    snprintf(t, sizeof t, "fan=%s\n", c.fan);
+    strcat(b, t);
+    if (*c.fan_paused) {
+        snprintf(t, sizeof t, "fan_paused=%s\nfan_paused_enabled=%s\n", c.fan_paused, c.fan_paused_enabled ? "on" : "off");
+        strcat(b, t);
+    }
     if (!write_text(CONF_PATH, b, 0644)) die("cannot write %s: %s", CONF_PATH, strerror(errno));
 }
 
@@ -298,6 +321,7 @@ static double smc_number(const smcval_t *v, bool *ok) {
     if (!strcmp(t, "ui32") && v->size == 4) return u32;
     if (!strcmp(t, "si32") && v->size == 4) return (int32_t)u32;
     if (!strcmp(t, "sp78") && v->size == 2) return (int16_t)u16 / 256.0;
+    if (!strcmp(t, "fpe2") && v->size == 2) return (d[0] << 8 | d[1]) / 4.0; /* always big-endian */
     if (!strcmp(t, "flt") && v->size == 4) { float f; memcpy(&f, &u32, 4); return f; }
     *ok = false;
     return 0;
@@ -476,7 +500,7 @@ typedef struct {
 _Static_assert(sizeof(SMCKeyData) == 80, "SMCKeyData must be 80 bytes");
 
 static io_connect_t g_conn = 0;
-static struct { char key[5]; int present; uint32_t size, type; } g_info[32];
+static struct { char key[5]; int present; uint32_t size, type; } g_info[64];
 static int g_ninfo = 0;
 
 static bool smc_available(void) { return true; }
@@ -508,7 +532,7 @@ static int smc_keyinfo(const char *key, uint32_t *size, uint32_t *type) {
     int present = out.result == 0;
     *size = out.keyInfo.dataSize;
     *type = out.keyInfo.dataType;
-    if (g_ninfo < 32) {
+    if (g_ninfo < 64) {
         memcpy(g_info[g_ninfo].key, key, 5);
         g_info[g_ninfo].present = present;
         g_info[g_ninfo].size = *size;
@@ -638,6 +662,379 @@ static void refuse_if_conflict(const char *what) {
     if (c && !g_force)
         die("%s is managing battery charging on this Mac - refusing to '%s' so the two do not fight.\n"
             "        Quit/uninstall %s first, or pass --force if you really want both.", c, what, c);
+}
+
+/* ------------------------------------------------------------------ fans */
+/* A manual speed is always clamped to the fan's own [min, max]: fans are never stopped or slowed below the
+ * SMC minimum.  "auto" hands the fans back to the SMC (or to mbpfan, if macbat had paused it). */
+#define MAXFAN 4
+#define FAN_HOT 90  /* thermal guard (daemon): back to automatic at this CPU temperature ... */
+#define FAN_COOL 75 /* ... and the manual speed again once it has cooled down to this */
+typedef struct { char label[24]; int cur, min, max, target, manual; } fan_t; /* rpm; manual: 1/0/-1 */
+typedef struct { int n; fan_t f[MAXFAN]; } fans_t;
+
+static bool fan_spec_ok(const char *s) {
+    if (!strcmp(s, "auto")) return true;
+    char *e;
+    long v = strtol(s, &e, 10);
+    if (e == s) return false;
+    if (*e == '%' && !e[1]) return v >= 0 && v <= 100;
+    return !*e && v > 0 && v <= 20000;
+}
+
+static bool fan_limits_ok(const fan_t *f) { return f->min > 0 && f->max > f->min; }
+
+/* rpm for "3000" / "50%" (0% = min, 100% = max), clamped to [min, max]; 0 for "auto" */
+static int fan_want(const char *spec, const fan_t *f) {
+    if (!strcmp(spec, "auto") || !fan_limits_ok(f)) return 0;
+    int v = atoi(spec);
+    if (spec[strlen(spec) - 1] == '%') v = f->min + (int)iround((f->max - f->min) * clampi(v, 0, 100) / 100.0);
+    return clampi(v, f->min, f->max);
+}
+
+static void fan_spec_text(const char *spec, char *o, size_t n) {
+    if (!strcmp(spec, "auto")) snprintf(o, n, "auto");
+    else if (spec[strlen(spec) - 1] == '%') snprintf(o, n, "%s", spec);
+    else snprintf(o, n, "%s RPM", spec);
+}
+
+static int lock_smc(void) {
+    int lk = open(LOCK_PATH, O_RDWR | O_CREAT, 0644);
+    if (lk >= 0) flock(lk, LOCK_EX);
+    return lk;
+}
+static void unlock_smc(int lk) { if (lk >= 0) { flock(lk, LOCK_UN); close(lk); } }
+
+#ifdef OS_LINUX
+static bool read_fans(fans_t *F) {
+    memset(F, 0, sizeof *F);
+    char p[128];
+    for (int i = 1; i <= MAXFAN; i++) {
+        snprintf(p, sizeof p, SMC_SYS "/fan%d_input", i);
+        if (!exists(p)) break;
+        fan_t *f = &F->f[F->n++];
+        f->cur = (int)read_long(p, -1);
+#define FR(field, name) (snprintf(p, sizeof p, SMC_SYS "/fan%d_" name, i), f->field = (int)read_long(p, -1))
+        FR(min, "min"); FR(max, "max"); FR(target, "output"); FR(manual, "manual");
+#undef FR
+        snprintf(p, sizeof p, SMC_SYS "/fan%d_label", i);
+        if (!read_text(p, f->label, sizeof f->label) || !*f->label) snprintf(f->label, sizeof f->label, "Fan %d", i);
+    }
+    return F->n > 0;
+}
+
+static bool fan_sysw(int i, const char *what, int v) {
+    char p[128], b[16];
+    snprintf(p, sizeof p, SMC_SYS "/fan%d_%s", i + 1, what);
+    snprintf(b, sizeof b, "%d", v);
+    return write_file(p, b);
+}
+
+/* rpm[i] > 0: manual at that speed, 0: automatic */
+static bool fans_set(const fans_t *F, const int *rpm, char *err, size_t en) {
+    int lk = lock_smc();
+    bool ok = true;
+    err[0] = 0;
+    for (int i = 0; i < F->n && ok; i++) {
+        ok = rpm[i] > 0 ? fan_sysw(i, "manual", 1) && fan_sysw(i, "output", rpm[i]) : fan_sysw(i, "manual", 0);
+        if (!ok) snprintf(err, en, "fan %d: %s", i + 1, strerror(errno));
+    }
+    unlock_smc(lk);
+    return ok;
+}
+
+/* other fan daemons would override a manual speed within a second */
+static const char *FAN_DAEMONS[] = {"mbpfan", "macfanctld"};
+static const char *fan_daemon(void) {
+    for (size_t i = 0; i < sizeof FAN_DAEMONS / sizeof FAN_DAEMONS[0]; i++)
+        if (RUN("systemctl", "is-active", "--quiet", FAN_DAEMONS[i]) == 0) return FAN_DAEMONS[i];
+    return NULL;
+}
+static bool fan_daemon_pause(conf_t *c, char *note, size_t n) {
+    const char *d = fan_daemon();
+    if (!d) return true;
+    bool en = RUN("systemctl", "is-enabled", "--quiet", d) == 0;
+    if (RUN("timeout", "20", "systemctl", "stop", d) != 0) { snprintf(note, n, "cannot stop %s", d); return false; }
+    if (en) RUN("systemctl", "disable", "--quiet", d);
+    snprintf(c->fan_paused, sizeof c->fan_paused, "%s", d);
+    c->fan_paused_enabled = en;
+    snprintf(note, n, " (%s paused)", d);
+    return true;
+}
+static void fan_daemon_resume(conf_t *c, char *note, size_t n) {
+    if (!*c->fan_paused) return;
+    if (c->fan_paused_enabled) RUN("systemctl", "enable", "--quiet", c->fan_paused);
+    bool ok = RUN("systemctl", "start", c->fan_paused) == 0;
+    snprintf(note, n, " (%s %s)", c->fan_paused, ok ? "back on" : "could NOT be started");
+    c->fan_paused[0] = 0;
+    c->fan_paused_enabled = false;
+}
+
+static double cpu_temp(void) { /* hottest coretemp sensor, -1 if none */
+    DIR *d = opendir("/sys/class/hwmon");
+    if (!d) return -1;
+    struct dirent *e;
+    char p[300], name[32];
+    double best = -1;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        snprintf(p, sizeof p, "/sys/class/hwmon/%s/name", e->d_name);
+        if (!read_text(p, name, sizeof name) || strcmp(name, "coretemp")) continue;
+        for (int i = 1; i < 64; i++) {
+            snprintf(p, sizeof p, "/sys/class/hwmon/%s/temp%d_input", e->d_name, i);
+            long t = read_long(p, -1);
+            if (t > 0 && t / 1000.0 > best) best = t / 1000.0;
+        }
+    }
+    closedir(d);
+    return best;
+}
+#else /* macOS */
+static int smc_int(const char *key) {
+    smcval_t v;
+    bool ok;
+    if (smc_read(key, &v) != 1) return -1;
+    double x = smc_number(&v, &ok);
+    return ok ? (int)iround(x) : -1;
+}
+
+static bool read_fans(fans_t *F) {
+    memset(F, 0, sizeof *F);
+    int n = smc_int("FNum");
+    if (n <= 0) return false;
+    smcval_t v;
+    int forced = smc_read("FS! ", &v) == 1 && v.size == 2 ? (v.data[0] << 8 | v.data[1]) : -1;
+    char k[8];
+    for (int i = 0; i < n && i < MAXFAN; i++) {
+        fan_t *f = &F->f[F->n++];
+        snprintf(f->label, sizeof f->label, "Fan %d", i + 1);
+#define FK(field, suffix) (snprintf(k, sizeof k, "F%d" suffix, i), f->field = smc_int(k))
+        FK(cur, "Ac"); FK(min, "Mn"); FK(max, "Mx"); FK(target, "Tg");
+#undef FK
+        snprintf(k, sizeof k, "F%dMd", i);
+        int md = smc_int(k);
+        f->manual = md >= 0 ? md == 1 : forced >= 0 ? (forced >> i) & 1 : -1;
+    }
+    return F->n > 0;
+}
+
+/* encode an rpm for a fan key in the key's own format (flt on Apple Silicon, fpe2 on Intel) */
+static int enc_rpm(const char *key, int rpm, uint8_t *d) {
+    smcval_t v;
+    if (smc_read(key, &v) != 1) return 0;
+    if (!strncmp(v.type, "flt", 3) && v.size == 4) {
+        float x = (float)rpm;
+        uint32_t u;
+        memcpy(&u, &x, 4);
+        for (int i = 0; i < 4; i++) d[i] = (uint8_t)(SMC_LE ? u >> (8 * i) : u >> (24 - 8 * i));
+        return 4;
+    }
+    if (!strncmp(v.type, "fpe2", 4) && v.size == 2) { d[0] = (uint8_t)(rpm >> 6); d[1] = (uint8_t)(rpm << 2); return 2; }
+    return 0;
+}
+
+/* EXPERIMENTAL (untested on real hardware): Apple Silicon uses F<n>Md (+ Ftst unlock), Intel the FS! bitmask */
+static bool fans_set(const fans_t *F, const int *rpm, char *err, size_t en) {
+    int lk = lock_smc();
+    bool ok = true, any = false;
+    char k[8];
+    err[0] = 0;
+    for (int i = 0; i < F->n; i++) any |= rpm[i] > 0;
+    if (smc_has("F0Md")) {
+        if (any && smc_has("Ftst")) { wr_t w = {"Ftst", {1}, 1}; ok = smc_write(&w, 1, err, en); }
+        for (int i = 0; i < F->n && ok; i++) {
+            snprintf(k, sizeof k, "F%dMd", i);
+            wr_t w = {k, {rpm[i] > 0 ? 1 : 0}, 1};
+            for (int t = 0; t < 30 && !(ok = smc_write(&w, 1, err, en)); t++) usleep(100000); /* thermalmonitord may resist */
+            if (ok && rpm[i] > 0) {
+                char tg[8];
+                snprintf(tg, sizeof tg, "F%dTg", i);
+                wr_t x = {tg, {0}, 0};
+                x.len = enc_rpm(tg, rpm[i], x.data);
+                ok = x.len ? smc_write(&x, 1, err, en) : (snprintf(err, en, "%s: unknown format", tg), false);
+            }
+        }
+        if (ok && !any && smc_has("Ftst")) { wr_t w = {"Ftst", {0}, 1}; ok = smc_write(&w, 1, err, en); }
+    } else {
+        smcval_t v;
+        if (smc_read("FS! ", &v) != 1 || v.size != 2) { snprintf(err, en, "no fan control keys"); unlock_smc(lk); return false; }
+        int mask = v.data[0] << 8 | v.data[1];
+        for (int i = 0; i < F->n && ok; i++) {
+            if (rpm[i] > 0) {
+                char tg[8];
+                snprintf(tg, sizeof tg, "F%dTg", i);
+                wr_t x = {tg, {0}, 0};
+                x.len = enc_rpm(tg, rpm[i], x.data);
+                ok = x.len ? smc_write(&x, 1, err, en) : (snprintf(err, en, "%s: unknown format", tg), false);
+                mask |= 1 << i;
+            } else mask &= ~(1 << i);
+        }
+        if (ok) { wr_t w = {"FS! ", {(uint8_t)(mask >> 8), (uint8_t)mask}, 2}; ok = smc_write(&w, 1, err, en); }
+    }
+    unlock_smc(lk);
+    return ok;
+}
+
+static const char *fan_app(void) { /* fan tools that would fight a manual speed */
+    static const char *procs[] = {"Macs Fan Control", "TG Pro", "smcFanControl"};
+    char out[256];
+    for (size_t i = 0; i < sizeof procs / sizeof procs[0]; i++)
+        if (RUN_OUT(out, "pgrep", "-x", procs[i]) == 0) return procs[i];
+    return NULL;
+}
+
+static double cpu_temp(void) { /* Intel Macs: CPU proximity / die sensor; Apple Silicon: not shown */
+    smcval_t v;
+    bool ok;
+    const char *keys[] = {"TC0P", "TC0D", "TC0E"};
+    for (size_t i = 0; i < 3; i++)
+        if (smc_read(keys[i], &v) == 1) { double t = smc_number(&v, &ok); if (ok && t > 0 && t < 130) return t; }
+    return -1;
+}
+#endif
+
+/* who is driving the fans right now: AUTO (SMC) / AUTO (MBPFAN) / MANUAL 3000 RPM / MANUAL (OTHER TOOL) */
+static void fan_mode(const conf_t *c, const fans_t *F, char *o, size_t n) {
+    bool manual = false;
+    for (int i = 0; i < F->n; i++) manual |= F->f[i].manual == 1;
+    const char *other = NULL;
+#ifdef OS_LINUX
+    other = fan_daemon();
+#else
+    other = fan_app();
+#endif
+    char sp[32];
+    fan_spec_text(c->fan, sp, sizeof sp);
+    if (other) snprintf(o, n, "auto (%s)", other);
+    else if (!manual && strcmp(c->fan, "auto")) snprintf(o, n, "auto (SMC) - %s pending", sp);
+    else if (!manual) snprintf(o, n, "auto (SMC)");
+    else if (strcmp(c->fan, "auto")) snprintf(o, n, "manual %s", sp);
+    else snprintf(o, n, "manual (other tool)");
+}
+
+/* set fans to "auto" or a manual speed, remember it in the config. Shared by 'macbat fan' and the settings screen. */
+static bool fan_apply(const char *spec, char *m, size_t n) {
+    fans_t F;
+    if (!read_fans(&F)) { snprintf(m, n, "no fans found"); return false; }
+    bool manual = strcmp(spec, "auto") != 0;
+    int rpm[MAXFAN] = {0};
+    for (int i = 0; manual && i < F.n; i++) {
+        if (!fan_limits_ok(&F.f[i])) { snprintf(m, n, "fan %d: min/max speed unknown - not changed", i + 1); return false; }
+        rpm[i] = fan_want(spec, &F.f[i]);
+    }
+    conf_t c = load_conf();
+    char note[160] = "", err[160];
+#ifdef OS_LINUX
+    const char *owner = fan_daemon();
+    if (!manual && owner && !*c.fan_paused) { /* mbpfan runs the fans: nothing of ours to undo */
+        snprintf(c.fan, sizeof c.fan, "auto");
+        save_conf(c);
+        snprintf(m, n, "fans: automatic (%s)", owner);
+        return true;
+    }
+#endif
+#ifdef OS_MAC
+    const char *app = fan_app();
+    if (app && !g_force) { snprintf(m, n, "%s controls the fans - not changed (--force overrides)", app); return false; }
+#else
+    if (manual && !fan_daemon_pause(&c, note, sizeof note)) { snprintf(m, n, "%s - fans not changed", note); return false; }
+#endif
+    snprintf(c.fan, sizeof c.fan, "%s", spec);
+    save_conf(c); /* records a paused mbpfan before anything else can fail */
+    bool ok = fans_set(&F, rpm, err, sizeof err);
+    if (!ok && manual) { /* never leave the fans half-configured: back to automatic */
+        int zero[MAXFAN] = {0};
+        char e2[160];
+        fans_set(&F, zero, e2, sizeof e2);
+        snprintf(c.fan, sizeof c.fan, "auto");
+    }
+#ifdef OS_LINUX
+    if (!manual || !ok) fan_daemon_resume(&c, note, sizeof note);
+#endif
+    save_conf(c);
+    if (!ok) { snprintf(m, n, "fan write failed: %s%s", err, note); return false; }
+    if (manual) {
+        char r[64] = "", t[16];
+        for (int i = 0; i < F.n; i++) { snprintf(t, sizeof t, "%s%d", i ? "/" : "", rpm[i]); strcat(r, t); }
+        char sp[32];
+        fan_spec_text(spec, sp, sizeof sp);
+        if (strchr(spec, '%')) snprintf(m, n, "fans: manual %s = %s RPM%s", sp, r, note);
+        else snprintf(m, n, "fans: manual %s RPM%s", r, note);
+    } else snprintf(m, n, "fans: automatic%s", note);
+    return true;
+}
+
+/* fans back to the SMC's automatic control when macbat owns them (restore, sleep, service stop, thermal guard) */
+static bool fans_release(void) {
+    conf_t c = load_conf();
+    if (!strcmp(c.fan, "auto")) return false;
+#ifdef OS_LINUX
+    if (fan_daemon()) return false; /* mbpfan (re)started by someone else: its fans, not ours */
+#endif
+    fans_t F;
+    if (!read_fans(&F)) return false;
+    bool any = false;
+    for (int i = 0; i < F.n; i++) any |= F.f[i].manual == 1;
+    if (!any) return false;
+    int zero[MAXFAN] = {0};
+    char err[160];
+    return fans_set(&F, zero, err, sizeof err);
+}
+
+/* daemon: keep the configured manual speed (after boot, resume, SMC resets) */
+static bool g_fan_guard = false;
+static void fan_enforce(const conf_t *c) {
+    static bool warned = false;
+    if (!strcmp(c->fan, "auto") || g_fan_guard) return;
+#ifdef OS_LINUX
+    const char *other = fan_daemon();
+#else
+    const char *other = fan_app();
+#endif
+    if (other) {
+        if (!warned) logmsg("fans: %s is running - leaving the fans to it (fan=%s not applied)", other, c->fan);
+        warned = true;
+        return;
+    }
+    warned = false;
+    fans_t F;
+    if (!read_fans(&F)) return;
+    int rpm[MAXFAN] = {0};
+    bool need = false;
+    for (int i = 0; i < F.n; i++) {
+        if (!fan_limits_ok(&F.f[i])) return;
+        rpm[i] = fan_want(c->fan, &F.f[i]);
+        if (F.f[i].manual != 1 || abs(F.f[i].target - rpm[i]) > 25) need = true;
+    }
+    if (!need) return;
+    char err[160];
+    if (fans_set(&F, rpm, err, sizeof err)) logmsg("fans: manual %d RPM (fan=%s)", rpm[0], c->fan);
+    else logmsg("fans: error: %s", err);
+}
+
+/* daemon, every few seconds: CPU at FAN_HOT -> automatic until it is back at FAN_COOL */
+static void fan_guard(const char *fan) {
+    if (!strcmp(fan, "auto")) { g_fan_guard = false; return; }
+    double t = cpu_temp();
+    if (t < 0) return;
+    if (!g_fan_guard && t >= FAN_HOT) {
+        g_fan_guard = true;
+        fans_release();
+        logmsg("fans: CPU %.0f°C - automatic control until it cools to %d°C", t, FAN_COOL);
+    } else if (g_fan_guard && t <= FAN_COOL) {
+        g_fan_guard = false;
+        logmsg("fans: CPU %.0f°C - manual speed again", t);
+    }
+}
+
+static void fans_json(const fans_t *F) {
+    printf("[");
+    for (int i = 0; i < F->n; i++) {
+        const fan_t *f = &F->f[i];
+        printf("%s{\"label\": \"%s\", \"rpm\": %d, \"min\": %d, \"max\": %d, \"target\": %d, \"manual\": %s}", i ? ", " : "",
+               f->label, f->cur, f->min, f->max, f->target, f->manual < 0 ? "null" : f->manual ? "true" : "false");
+    }
+    printf("]");
 }
 
 /* ------------------------------------------------------------------ battery */
@@ -806,7 +1203,7 @@ static int plan(const conf_t *c, const battery_t *b, const control_t *s, const c
         bool off = s->adapter_off == 1, want_off;
         if (floor || limit >= 100 || !c->auto_discharge) want_off = false;
         else if (off) want_off = pct > limit;        /* keep discharging down to the limit */
-        else want_off = b->ac == 1 && pct > limit;
+        else want_off = b->ac == 1 && pct >= limit + c->hysteresis; /* band: no toggling at limit / limit+1 */
         if (want_off != off) n += w_adapter(w + n, cp, !want_off);
     }
     return n;
@@ -888,6 +1285,7 @@ static void on_hup(int s) { (void)s; g_kick = 1; }
 
 static caps_t g_dcaps;
 static void daemon_restore(const char *why) {
+    if (fans_release()) logmsg("%s: fans automatic", why);
     wr_t w[4];
     int n = restore_plan(&g_dcaps, w);
     if (!n) return;
@@ -932,13 +1330,17 @@ static int cmd_daemon(void) {
 #endif
     time_t last_mtime = -1;
     time_t next = 0;
+    char dfan[16] = "auto";
     while (!g_stop) {
+        fan_guard(dfan);
         time_t mt = conf_mtime(), now = time(NULL);
         if (g_kick || mt != last_mtime || now >= next) {
             g_kick = 0;
             last_mtime = mt;
             conf_t c = load_conf();
             apply_sys_settings(&c);
+            snprintf(dfan, sizeof dfan, "%s", c.fan);
+            fan_enforce(&c);
             if (!can_sleep_hook) c.auto_discharge = false;
             battery_t b;
             if (read_battery(&b)) {
@@ -982,6 +1384,8 @@ static const char *service_state(void) {
     return strstr(out, "state = running") ? "active" : "loaded";
 #endif
 }
+
+static bool svc_active(void) { return !strcmp(service_state(), "active"); }
 
 static void print_bar(int pct, int limit, bool utf) {
     const int W = 24;
@@ -1223,6 +1627,17 @@ static void status_retro(const conf_t *c, const battery_t *b, const caps_t *cp, 
         snprintf(v, sizeof v, "%s%s IN %s", T.value, b->tte >= 0 ? "EMPTY" : "FULL", m);
         r_field(&T, "TIME", v);
     }
+    fans_t F;
+    if (read_fans(&F)) {
+        char fm[64], ft[48];
+        fan_mode(c, &F, fm, sizeof fm);
+        upcase(fm);
+        snprintf(v, sizeof v, "%s", T.value);
+        for (int i = 0; i < F.n; i++) { snprintf(ft, sizeof ft, "%s%d", i ? " · " : "", F.f[i].cur); strcat(v, ft); }
+        snprintf(ft, sizeof ft, " RPM %s· %s", T.dim, fm);
+        strcat(v, ft);
+        r_field(&T, F.n > 1 ? "FANS" : "FAN", v);
+    }
     const char *svc = service_state();
     char su[32];
     snprintf(su, sizeof su, "%s", svc);
@@ -1281,6 +1696,16 @@ static int cmd_status(bool json) {
                    cp.inhibit ? "\"" : "", cp.inhibit ? cp.inhibit : "null", cp.inhibit ? "\"" : "",
                    cp.discharge ? "\"" : "", cp.discharge ? cp.discharge : "null", cp.discharge ? "\"" : "",
                    s.hw_limit, s.charging_blocked, s.adapter_off);
+        fans_t F;
+        if (read_fans(&F)) {
+            char fm[64];
+            fan_mode(&c, &F, fm, sizeof fm);
+            printf("  \"fans\": ");
+            fans_json(&F);
+            printf(",\n");
+            json_str("fan_mode", fm, true);
+            json_str("fan_setting", c.fan, true);
+        }
         json_str("mode", mode, true);
         json_str("control_source", source, true);
         json_str("conflict", conf_app, true);
@@ -1342,10 +1767,155 @@ static int cmd_status(bool json) {
         fmt_min(b.ttf, f, sizeof f);
         printf("  Time      to empty %s  %s  to full %s\n", e, dot, f);
     }
+    fans_t F;
+    if (read_fans(&F)) {
+        char fm[64];
+        fan_mode(&c, &F, fm, sizeof fm);
+        printf("  Fans      ");
+        for (int i = 0; i < F.n; i++) printf("%s%d", i ? " / " : "", F.f[i].cur);
+        printf(" rpm  %s  %s\n", dot, fm);
+    }
     printf("  Service   %s", service_state());
     if (strcmp(source, "live")) printf("  %s  control: %s", dot, source);
     printf("\n");
     return 0;
+}
+
+/* ------------------------------------------------------------------ fan page (macbat fan) */
+static void fan_retro(const conf_t *c, const fans_t *F, const char *fm, double temp, const char *model) {
+    theme_t T = theme();
+    char l[1024], r[256], v[512], t[96];
+    const int GW = 26;
+    r_rule(&T, "╔", "═", "╗");
+    snprintf(l, sizeof l, "%s█▒░ M A C B A T ░▒█%s  %sFANS%s", T.title, T.reset, T.label, T.reset);
+    snprintf(r, sizeof r, "%sv%s · %s%s", T.dim, MACBAT_VERSION, model, T.reset);
+    r_split(&T, l, r);
+    char pn[64], ts[16];
+    snprintf(pn, sizeof pn, "%s", platform_name());
+    upcase(pn);
+    time_t now = time(NULL);
+    strftime(ts, sizeof ts, "%H:%M:%S", localtime(&now));
+    snprintf(l, sizeof l, "%s%s%s", T.label, pn, T.reset);
+    snprintf(r, sizeof r, "%s%s%s", T.dim, ts, T.reset);
+    r_split(&T, l, r);
+    r_rule(&T, "╠", "═", "╣");
+    for (int i = 0; i < F->n; i++) {
+        const fan_t *f = &F->f[i];
+        if (i) r_line(&T, "");
+        int mx = f->max > 0 ? f->max : 1;
+        int fill = clampi((int)iround((double)f->cur / mx * GW), 0, GW);
+        int mark = f->min > 0 ? clampi((int)iround((double)f->min / mx * GW), 0, GW - 1) : -1;
+        double frac = fan_limits_ok(f) ? (double)(f->cur - f->min) / (f->max - f->min) : 0;
+        const char *lvl = frac < 0.5 ? T.ok : frac < 0.8 ? T.hi : T.bad;
+        char lab[48], rpm[16];
+        if (!strncmp(f->label, "Fan ", 4)) snprintf(lab, sizeof lab, "FAN %d", i + 1);
+        else snprintf(lab, sizeof lab, "FAN %d · %s", i + 1, f->label);
+        upcase(lab);
+        snprintf(rpm, sizeof rpm, "%d", f->cur < 0 ? 0 : f->cur);
+        for (int row = 0; row < 5; row++) {
+            char g[1024] = "", dg[256];
+            if (row >= 1 && row <= 3) {
+                strcat(g, T.frame);
+                strcat(g, row == 1 ? "┌" : row == 2 ? "│" : "└");
+                for (int k = 0; k < GW; k++) {
+                    if (row == 2) {
+                        strcat(g, k < fill ? lvl : T.dim);
+                        strcat(g, k < fill ? "█" : "░");
+                        strcat(g, T.frame);
+                    } else strcat(g, k == mark ? (row == 1 ? "┬" : "┴") : "─");
+                }
+                strcat(g, row == 1 ? "┐ " : row == 2 ? "│ " : "┘ ");
+                strcat(g, T.reset);
+            } else {
+                char txt[96] = "";
+                if (row == 0) snprintf(txt, sizeof txt, "%s%s%s", T.label, lab, T.reset);
+                else if (mark >= 0) snprintf(txt, sizeof txt, "%*s%s▲ MIN %d%s", mark + 1, "", T.dim, f->min, T.reset);
+                vis_trunc(txt, GW + 3);
+                snprintf(g, sizeof g, "%s%*s", txt, GW + 3 - vis_width(txt), "");
+            }
+            big_row(rpm, row, dg, sizeof dg);
+            snprintf(l, sizeof l, "  %s     %s%s%s%s", g, lvl, dg, row == 4 ? " RPM" : "", T.reset);
+            r_line(&T, l);
+        }
+    }
+    r_rule(&T, "╟", "─", "╢");
+    char fmu[64];
+    snprintf(fmu, sizeof fmu, "%s", fm);
+    upcase(fmu);
+    snprintf(v, sizeof v, "%s%s", strncmp(fm, "manual", 6) ? T.value : T.hi, fmu);
+    r_field(&T, "MODE", v);
+    snprintf(v, sizeof v, "%s", T.value);
+    for (int i = 0; i < F->n; i++) { snprintf(t, sizeof t, "%s%d-%d", i ? " · " : "", F->f[i].min, F->f[i].max); strcat(v, t); }
+    strcat(v, " RPM");
+    r_field(&T, "RANGE", v);
+    snprintf(v, sizeof v, "%s", T.value);
+    for (int i = 0; i < F->n; i++) { snprintf(t, sizeof t, "%s%d", i ? " · " : "", F->f[i].target); strcat(v, t); }
+    strcat(v, " RPM");
+    r_field(&T, "TARGET", v);
+    if (temp > 0) {
+        snprintf(v, sizeof v, "%s%.1f°C %s· THERMAL GUARD AT %d°C", temp >= FAN_HOT ? T.bad : T.value, temp, T.dim, FAN_HOT);
+        r_field(&T, "CPU", v);
+    }
+    char sp[32];
+    fan_spec_text(c->fan, sp, sizeof sp);
+    upcase(sp);
+    if (!strcmp(c->fan, "auto")) snprintf(v, sizeof v, "%sAUTO", T.value);
+    else {
+        snprintf(v, sizeof v, "%s%s %s· %s", T.value, sp, T.dim, svc_active() ? "KEPT BY THE SERVICE" : "SERVICE NOT RUNNING");
+        if (*c->fan_paused) { snprintf(t, sizeof t, " · %s OFF", c->fan_paused); upcase(t); strcat(v, t); }
+    }
+    r_field(&T, "SETTING", v);
+    snprintf(l, sizeof l, "%ssudo macbat fan set <rpm|NN%%>  ·  sudo macbat fan auto%s", T.dim, T.reset);
+    r_line(&T, l);
+    r_rule(&T, "╚", "═", "╝");
+}
+
+static int cmd_fan(const char *a, const char *b, bool json) {
+    if (!a || !strcmp(a, "show") || !strcmp(a, "status")) {
+        fans_t F;
+        if (!read_fans(&F)) die("no fans found");
+        conf_t c = load_conf();
+        char fm[64], model[64];
+        fan_mode(&c, &F, fm, sizeof fm);
+        model_name(model, sizeof model);
+        double temp = cpu_temp();
+        if (json) {
+            printf("{\n  \"fans\": ");
+            fans_json(&F);
+            printf(",\n");
+            json_str("mode", fm, true);
+            json_str("setting", c.fan, true);
+            json_str("paused_daemon", *c.fan_paused ? c.fan_paused : NULL, true);
+            if (temp > 0) printf("  \"cpu_temp_c\": %.1f\n}\n", temp); else printf("  \"cpu_temp_c\": null\n}\n");
+        } else if (use_retro()) fan_retro(&c, &F, fm, temp, model);
+        else {
+            printf("macbat %s - %s - fans\n", MACBAT_VERSION, model);
+            for (int i = 0; i < F.n; i++)
+                printf("  Fan %d     %d rpm  (%s, min %d, max %d, target %d)\n", i + 1, F.f[i].cur, F.f[i].label, F.f[i].min,
+                       F.f[i].max, F.f[i].target);
+            printf("  Mode      %s\n  Setting   %s%s%s\n", fm, c.fan, *c.fan_paused ? ", paused: " : "", c.fan_paused);
+            if (temp > 0) printf("  CPU       %.1f C\n", temp);
+        }
+        return 0;
+    }
+    const char *spec = !strcmp(a, "auto") ? "auto" : !strcmp(a, "set") ? b : NULL;
+    if (!strcmp(a, "set") && !b) die("usage: macbat fan set <rpm|NN%%>   e.g. 3000 or 50%%");
+    if (!spec) die("usage: macbat fan [auto | set <rpm|NN%%>]");
+    if (!fan_spec_ok(spec))
+        die("fan speed must be an RPM (e.g. 3000 - clamped to the fan's min..max) or a percentage of that range\n"
+            "        (0%% = min, 100%% = max). Fans cannot be switched off.");
+    need_root("fan");
+    char m[256];
+    bool had = *load_conf().fan_paused;
+    bool ok = fan_apply(spec, m, sizeof m);
+    printf("%s\n", m);
+    conf_t c = load_conf();
+    if (ok && !had && *c.fan_paused)
+        printf("%s was stopped%s so it cannot override this speed - 'sudo macbat fan auto' %s it again.\n", c.fan_paused,
+               c.fan_paused_enabled ? " and disabled" : "", c.fan_paused_enabled ? "enables and starts" : "starts");
+    if (ok && strcmp(spec, "auto") && !svc_active())
+        printf("note: the macbat service is not running - the speed is not re-applied after reboot / sleep\n");
+    return ok ? 0 : 1;
 }
 
 /* ------------------------------------------------------------------ settings */
@@ -1395,6 +1965,8 @@ static int cmd_discharge(const char *v) {
 
 static int cmd_restore(void) {
     need_root("restore");
+    bool fans = fans_release();
+    if (fans && !g_quiet) printf("fans back to automatic control\n");
     refuse_if_conflict("restore");
     caps_t cp;
     if (!get_caps(&cp)) die("cannot read the SMC");
@@ -1408,7 +1980,8 @@ static int cmd_restore(void) {
 }
 
 static int cmd_keys(void) {
-    static const char *keys[] = {"BCLM", "CHTE", "CH0B", "CH0C", "CHIE", "CH0I", "ACEN", "ACLC", "B0AV", "B0FC", "B0CT", "TB0T", "BFCL"};
+    static const char *keys[] = {"BCLM", "CHTE", "CH0B", "CH0C", "CHIE", "CH0I", "ACEN", "ACLC", "B0AV", "B0FC", "B0CT", "TB0T", "BFCL",
+                                 "FNum", "F0Ac", "F0Mn", "F0Mx", "F0Tg", "F0Md", "FS! ", "Ftst"};
     for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
         smcval_t v;
         int r = smc_read(keys[i], &v);
@@ -1494,6 +2067,12 @@ static int cmd_uninstall(void) {
     unlink(LAUNCHD_PLIST);
 #endif
     unlink(STATE_PATH);
+    conf_t fc = load_conf();
+    if (strcmp(fc.fan, "auto") || *fc.fan_paused) {
+        char m[256];
+        fan_apply("auto", m, sizeof m);
+        printf("%s\n", m);
+    }
     if (conflict() && !g_force) {
         printf("service removed. %s is managing charging, so SMC values were left untouched.\n", conflict());
         return 0;
@@ -1511,15 +2090,6 @@ static int cmd_uninstall(void) {
 }
 
 /* ------------------------------------------------------------------ system power / display settings */
-__attribute__((unused)) static bool write_file(const char *path, const char *val) {
-    int fd = open(path, O_WRONLY | O_NOCTTY);
-    if (fd < 0) return false;
-    size_t len = strlen(val);
-    ssize_t n = write(fd, val, len);
-    close(fd);
-    return n == (ssize_t)len;
-}
-
 __attribute__((unused)) static void set_conf_str(char *dst, size_t n, const char *v) { snprintf(dst, n, "%s", v ? v : ""); }
 
 #ifdef OS_LINUX
@@ -1730,11 +2300,11 @@ typedef struct {
     int (*dyn)(char (*o)[32], int max);
     bool (*get)(char *out, size_t n);
     bool (*set)(const char *tok, char *msg, size_t n);
+    bool (*show)(char *out, size_t n); /* optional: live text instead of the value name */
 } setting_t;
 
 static bool av_always(void) { return true; }
-static bool svc_running(void) { return !strcmp(service_state(), "active"); }
-__attribute__((unused)) static const char *persist_note(void) { return svc_running() ? "" : " (install the service to keep it after reboot)"; }
+__attribute__((unused)) static const char *persist_note(void) { return svc_active() ? "" : " (install the service to keep it after reboot)"; }
 
 /* battery */
 static bool g_limit(char *o, size_t n) { snprintf(o, n, "%d", load_conf().limit); return true; }
@@ -1753,7 +2323,7 @@ static bool s_limit(const char *t, char *m, size_t n) {
             if (!do_write(w, 1, err, sizeof err)) { snprintf(m, n, "saved, but SMC write failed: %s", err); return false; }
         }
     }
-    snprintf(m, n, "charge limit %d%%%s", c.limit, svc_running() ? "" : " - start the service for discharge/software limit");
+    snprintf(m, n, "charge limit %d%%%s", c.limit, svc_active() ? "" : " - start the service for discharge/software limit");
     return true;
 }
 static bool g_dis(char *o, size_t n) { snprintf(o, n, "%s", load_conf().auto_discharge ? "on" : "off"); return true; }
@@ -1777,6 +2347,46 @@ static bool s_restore(const char *t, char *m, size_t n) {
     describe(w, k, &cp, d, sizeof d);
     if (!do_write(w, k, err, sizeof err)) { snprintf(m, n, "%s", err); return false; }
     snprintf(m, n, "%s", k ? d : "charging and adapter already normal");
+    return true;
+}
+
+/* fans (both platforms) */
+static bool av_fans(void) { fans_t F; return read_fans(&F); }
+static int dyn_fan(char (*o)[32], int max) {
+    int k = 0;
+    snprintf(o[k++], 32, "auto");
+    for (int p = 0; p <= 100 && k < max; p += 10) snprintf(o[k++], 32, "%d%%", p);
+    return k;
+}
+static bool g_fan(char *o, size_t n) { /* nearest 10 % step, so the arrows continue from a CLI-set rpm */
+    conf_t c = load_conf();
+    fans_t F;
+    if (!strcmp(c.fan, "auto")) { snprintf(o, n, "auto"); return true; }
+    int p = atoi(c.fan);
+    if (!strchr(c.fan, '%')) {
+        if (!read_fans(&F) || !fan_limits_ok(&F.f[0])) { snprintf(o, n, "auto"); return true; }
+        p = (int)iround(100.0 * (p - F.f[0].min) / (F.f[0].max - F.f[0].min));
+    }
+    snprintf(o, n, "%d%%", clampi((int)iround(p / 10.0) * 10, 0, 100));
+    return true;
+}
+static bool s_fan(const char *t, char *m, size_t n) { return fan_apply(t, m, n); }
+static bool show_fan(char *o, size_t n) {
+    fans_t F;
+    if (!read_fans(&F)) return false;
+    conf_t c = load_conf();
+    char r[48] = "", t[16], sp[32];
+    for (int i = 0; i < F.n; i++) { snprintf(t, sizeof t, "%s%d", i ? "/" : "", F.f[i].cur); strcat(r, t); }
+#ifdef OS_LINUX
+    const char *other = fan_daemon();
+#else
+    const char *other = fan_app();
+#endif
+    fan_spec_text(c.fan, sp, sizeof sp);
+    if (other) snprintf(o, n, "%s · %s RPM", other, r);
+    else if (!strcmp(c.fan, "auto")) snprintf(o, n, "AUTO · %s RPM", r);
+    else snprintf(o, n, "%s · NOW %s", sp, r);
+    upcase(o);
     return true;
 }
 
@@ -1941,26 +2551,27 @@ static int dyn_aspm(char (*o)[32], int max) {
 static bool s_aspm(const char *t, char *m, size_t n) { TLP_OR_CONF(aspm, "PCIE_ASPM_ON_AC", "PCIE_ASPM_ON_BAT", t, lx_aspm_apply, "PCIe ASPM"); }
 
 static const setting_t SETTINGS[] = {
-    {"BATTERY", "Charge limit", K_NUM, {0}, {0}, 20, 100, 5, av_always, NULL, g_limit, s_limit},
-    {"BATTERY", "Auto-discharge above limit", K_OPTS, {"on", "off"}, {0}, 0, 0, 0, av_always, NULL, g_dis, s_dis},
-    {"BATTERY", "Resume charging now", K_ACTION, {0}, {0}, 0, 0, 0, av_always, NULL, g_act, s_restore},
+    {"BATTERY", "Charge limit", K_NUM, {0}, {0}, 20, 100, 5, av_always, NULL, g_limit, s_limit, NULL},
+    {"BATTERY", "Auto-discharge above limit", K_OPTS, {"on", "off"}, {0}, 0, 0, 0, av_always, NULL, g_dis, s_dis, NULL},
+    {"BATTERY", "Resume charging now", K_ACTION, {0}, {0}, 0, 0, 0, av_always, NULL, g_act, s_restore, NULL},
+    {"FANS", "Fan speed", K_OPTS, {0}, {0}, 0, 0, 0, av_fans, dyn_fan, g_fan, s_fan, show_fan},
     {"DISPLAY", "Screen off when idle", K_OPTS, {"0", "60", "120", "300", "600", "900", "1800"},
-     {"NEVER", "1 MIN", "2 MIN", "5 MIN", "10 MIN", "15 MIN", "30 MIN"}, 0, 0, 0, av_always, NULL, g_blank, s_blank},
-    {"DISPLAY", "Display brightness", K_NUM, {0}, {0}, 5, 100, 5, av_bl, NULL, g_bl, s_bl},
-    {"DISPLAY", "Keyboard backlight", K_NUM, {0}, {0}, 0, 100, 10, av_kbd, NULL, g_kbd, s_kbd},
-    {"SLEEP", "Lid close", K_OPTS, {"suspend", "lock", "ignore", "poweroff"}, {0}, 0, 0, 0, av_always, NULL, g_lid, s_lid},
-    {"SLEEP", "Power button", K_OPTS, {"poweroff", "suspend", "ignore"}, {0}, 0, 0, 0, av_always, NULL, g_pwr, s_pwr},
+     {"NEVER", "1 MIN", "2 MIN", "5 MIN", "10 MIN", "15 MIN", "30 MIN"}, 0, 0, 0, av_always, NULL, g_blank, s_blank, NULL},
+    {"DISPLAY", "Display brightness", K_NUM, {0}, {0}, 5, 100, 5, av_bl, NULL, g_bl, s_bl, NULL},
+    {"DISPLAY", "Keyboard backlight", K_NUM, {0}, {0}, 0, 100, 10, av_kbd, NULL, g_kbd, s_kbd, NULL},
+    {"SLEEP", "Lid close", K_OPTS, {"suspend", "lock", "ignore", "poweroff"}, {0}, 0, 0, 0, av_always, NULL, g_lid, s_lid, NULL},
+    {"SLEEP", "Power button", K_OPTS, {"poweroff", "suspend", "ignore"}, {0}, 0, 0, 0, av_always, NULL, g_pwr, s_pwr, NULL},
     {"SLEEP", "Sleep when idle", K_OPTS, {"0", "900", "1800", "3600", "7200"}, {"NEVER", "15 MIN", "30 MIN", "1 HOUR", "2 HOURS"},
-     0, 0, 0, av_always, NULL, g_idle, s_idle},
+     0, 0, 0, av_always, NULL, g_idle, s_idle, NULL},
     {"DISK", "SATA link power (ALPM)", K_OPTS, {"max_performance", "medium_power", "med_power_with_dipm", "min_power"},
-     {"MAX PERFORMANCE", "MEDIUM", "MEDIUM + DIPM", "MIN POWER"}, 0, 0, 0, av_alpm, NULL, lx_alpm_get, s_alpm},
+     {"MAX PERFORMANCE", "MEDIUM", "MEDIUM + DIPM", "MIN POWER"}, 0, 0, 0, av_alpm, NULL, lx_alpm_get, s_alpm, NULL},
     {"DISK", "Disk spin-down", K_OPTS, {"0", "60", "120", "241", "242"}, {"NEVER", "5 MIN", "10 MIN", "30 MIN", "1 HOUR"},
-     0, 0, 0, av_spin, NULL, g_spin, s_spin},
-    {"POWER SAVING", "Wi-Fi power save", K_OPTS, {"on", "off"}, {0}, 0, 0, 0, av_wifi, NULL, lx_wifi_get, s_wifi},
-    {"POWER SAVING", "USB autosuspend", K_OPTS, {"on", "off"}, {0}, 0, 0, 0, av_usb, NULL, lx_usb_get, s_usb},
-    {"POWER SAVING", "CPU governor", K_OPTS, {0}, {0}, 0, 0, 0, av_gov, dyn_gov, lx_gov_get, s_gov},
-    {"POWER SAVING", "CPU turbo boost", K_OPTS, {"on", "off"}, {0}, 0, 0, 0, av_turbo, NULL, lx_turbo_get, s_turbo},
-    {"POWER SAVING", "PCIe ASPM", K_OPTS, {0}, {0}, 0, 0, 0, av_aspm, dyn_aspm, lx_aspm_get, s_aspm},
+     0, 0, 0, av_spin, NULL, g_spin, s_spin, NULL},
+    {"POWER SAVING", "Wi-Fi power save", K_OPTS, {"on", "off"}, {0}, 0, 0, 0, av_wifi, NULL, lx_wifi_get, s_wifi, NULL},
+    {"POWER SAVING", "USB autosuspend", K_OPTS, {"on", "off"}, {0}, 0, 0, 0, av_usb, NULL, lx_usb_get, s_usb, NULL},
+    {"POWER SAVING", "CPU governor", K_OPTS, {0}, {0}, 0, 0, 0, av_gov, dyn_gov, lx_gov_get, s_gov, NULL},
+    {"POWER SAVING", "CPU turbo boost", K_OPTS, {"on", "off"}, {0}, 0, 0, 0, av_turbo, NULL, lx_turbo_get, s_turbo, NULL},
+    {"POWER SAVING", "PCIe ASPM", K_OPTS, {0}, {0}, 0, 0, 0, av_aspm, dyn_aspm, lx_aspm_get, s_aspm, NULL},
 };
 #else /* macOS: pmset */
 static bool pm_get(const char *key, char *o, size_t n) {
@@ -1991,16 +2602,17 @@ PM(dks, "disksleep", "disk sleep (min)")
 PM(nap, "powernap", "power nap")
 PM(lpm, "lowpowermode", "low power mode")
 static const setting_t SETTINGS[] = {
-    {"BATTERY", "Charge limit", K_NUM, {0}, {0}, 20, 100, 5, av_always, NULL, g_limit, s_limit},
-    {"BATTERY", "Auto-discharge above limit", K_OPTS, {"on", "off"}, {0}, 0, 0, 0, av_always, NULL, g_dis, s_dis},
-    {"BATTERY", "Resume charging now", K_ACTION, {0}, {0}, 0, 0, 0, av_always, NULL, g_act, s_restore},
+    {"BATTERY", "Charge limit", K_NUM, {0}, {0}, 20, 100, 5, av_always, NULL, g_limit, s_limit, NULL},
+    {"BATTERY", "Auto-discharge above limit", K_OPTS, {"on", "off"}, {0}, 0, 0, 0, av_always, NULL, g_dis, s_dis, NULL},
+    {"BATTERY", "Resume charging now", K_ACTION, {0}, {0}, 0, 0, 0, av_always, NULL, g_act, s_restore, NULL},
+    {"FANS", "Fan speed", K_OPTS, {0}, {0}, 0, 0, 0, av_fans, dyn_fan, g_fan, s_fan, show_fan},
     {"DISPLAY", "Display sleep", K_OPTS, {"0", "1", "2", "5", "10", "15", "30"}, {"NEVER", "1 MIN", "2 MIN", "5 MIN", "10 MIN", "15 MIN", "30 MIN"},
-     0, 0, 0, av_dsl, NULL, g_dsl, s_dsl},
+     0, 0, 0, av_dsl, NULL, g_dsl, s_dsl, NULL},
     {"SLEEP", "System sleep", K_OPTS, {"0", "1", "5", "10", "15", "30", "60"}, {"NEVER", "1 MIN", "5 MIN", "10 MIN", "15 MIN", "30 MIN", "1 HOUR"},
-     0, 0, 0, av_ssl, NULL, g_ssl, s_ssl},
-    {"SLEEP", "Power Nap", K_OPTS, {"1", "0"}, {"ON", "OFF"}, 0, 0, 0, av_nap, NULL, g_nap, s_nap},
-    {"SLEEP", "Low power mode", K_OPTS, {"1", "0"}, {"ON", "OFF"}, 0, 0, 0, av_lpm, NULL, g_lpm, s_lpm},
-    {"DISK", "Disk sleep", K_OPTS, {"0", "10", "30", "60"}, {"NEVER", "10 MIN", "30 MIN", "1 HOUR"}, 0, 0, 0, av_dks, NULL, g_dks, s_dks},
+     0, 0, 0, av_ssl, NULL, g_ssl, s_ssl, NULL},
+    {"SLEEP", "Power Nap", K_OPTS, {"1", "0"}, {"ON", "OFF"}, 0, 0, 0, av_nap, NULL, g_nap, s_nap, NULL},
+    {"SLEEP", "Low power mode", K_OPTS, {"1", "0"}, {"ON", "OFF"}, 0, 0, 0, av_lpm, NULL, g_lpm, s_lpm, NULL},
+    {"DISK", "Disk sleep", K_OPTS, {"0", "10", "30", "60"}, {"NEVER", "10 MIN", "30 MIN", "1 HOUR"}, 0, 0, 0, av_dks, NULL, g_dks, s_dks, NULL},
 };
 #endif
 #define NSET ((int)(sizeof SETTINGS / sizeof SETTINGS[0]))
@@ -2202,8 +2814,10 @@ static int cmd_tui(char **argv) {
                 continue;
             }
             char tok[64] = "", val[64];
-            bool ok = st->get(tok, sizeof tok);
-            value_text(st, tok, ok, val, sizeof val);
+            if (!st->show || !st->show(val, sizeof val)) {
+                bool ok = st->get(tok, sizeof tok);
+                value_text(st, tok, ok, val, sizeof val);
+            }
             char dots[80] = "";
             int dl = 30 - (int)strlen(st->label);
             for (int d = 0; d < dl; d++) strcat(dots, "·");
@@ -2218,8 +2832,8 @@ static int cmd_tui(char **argv) {
         r_rule(&T, "╟", "─", "╢");
         snprintf(l, sizeof l, "%s%s%s", msg_ok ? T.ok : T.warn, msg, T.reset);
         r_line(&T, l);
-        snprintf(l, sizeof l, "%s↑↓ select  ←→ change  ENTER apply/run  R refresh  %sQ quit%s", T.dim,
-                 root ? "" : "S sudo  ", T.reset);
+        snprintf(l, sizeof l, "%s↑↓ select  ←→ change  ENTER apply/run  %sQ quit%s", T.dim,
+                 root ? "R refresh  " : "S sudo  ", T.reset);
         r_line(&T, l);
         r_rule(&T, "╚", "═", "╝");
         fputs("\033[J", stdout);
@@ -2254,11 +2868,14 @@ static void usage(void) {
     puts("macbat " MACBAT_VERSION " - battery charge limiter & status for Apple laptops\n"
          "\n"
          "usage:\n"
-         "  macbat                        interactive settings screen (battery, display, sleep, disk, power saving)\n"
+         "  macbat                        interactive settings screen (battery, fans, display, sleep, disk, power saving)\n"
          "  macbat status [--json|--plain] battery and charge-limit status\n"
          "  sudo macbat limit [20-100|off] show / set the charge limit\n"
          "  sudo macbat discharge [on|off] auto-discharge (bypass the adapter) while above the limit\n"
-         "  sudo macbat restore           resume charging and re-enable the adapter now\n"
+         "  sudo macbat restore           resume charging, re-enable the adapter, fans to automatic - now\n"
+         "  macbat fan [--json|--plain]   fan speeds, limits and mode\n"
+         "  sudo macbat fan set <rpm|NN%> fixed fan speed, clamped to the fan's min..max (0% = min, 100% = max)\n"
+         "  sudo macbat fan auto          automatic fan control again (re-enables mbpfan if macbat paused it)\n"
          "  sudo macbat install           install + start the background service (systemd / launchd)\n"
          "  sudo macbat uninstall         remove the service, restore normal charging (100%)\n"
          "  macbat keys                   show the relevant SMC keys (diagnostics)\n"
@@ -2266,7 +2883,7 @@ static void usage(void) {
          "\n"
          "options: --force (ignore other charge managers such as AlDente), --quiet, --plain\n"
          "env:     MACBAT_THEME=amber (default green), NO_COLOR=1\n"
-         "config:  " CONF_PATH "  (limit, auto_discharge, hysteresis, interval)\n"
+         "config:  " CONF_PATH "  (limit, auto_discharge, hysteresis, interval, fan)\n"
          "https://github.com/neuralfoundry-coder/macbat");
 }
 
@@ -2294,6 +2911,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "install")) return cmd_install();
     if (!strcmp(cmd, "uninstall")) return cmd_uninstall();
     if (!strcmp(cmd, "keys")) return cmd_keys();
+    if (!strcmp(cmd, "fan") || !strcmp(cmd, "fans")) return cmd_fan(pos[1], pos[2], json);
     if (!strcmp(cmd, "daemon")) return cmd_daemon();
     usage();
     return 2;

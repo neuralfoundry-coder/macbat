@@ -20,9 +20,10 @@ Priority: optional
 Architecture: amd64
 Maintainer: neuralfoundry-coder <233372748+neuralfoundry-coder@users.noreply.github.com>
 Homepage: https://github.com/neuralfoundry-coder/macbat
-Description: battery charge limiter and status for Intel MacBooks on Linux
- Hardware charge limit (SMC BCLM) and auto-discharge (ACEN) for Apple laptops
- running Linux, plus a battery status page. Installs the macbat systemd service.
+Description: battery charge limiter, fan control and status for Intel MacBooks on Linux
+ Hardware charge limit (SMC BCLM), auto-discharge (ACEN) and fan control
+ (applesmc) for Apple laptops running Linux, plus battery / fan status pages
+ and a settings screen. Installs the macbat systemd service.
 CTL
   printf '#!/bin/sh\nset -e\nif [ \"\$1\" = configure ]; then\n  if [ -d /sys/devices/platform/applesmc.768 ]; then /usr/bin/macbat install || echo \"macbat: service not started (see above)\"; else echo \"macbat: applesmc not found - not an Intel Mac? service not installed\"; fi\nfi\nexit 0\n' > \$d/DEBIAN/postinst
   printf '#!/bin/sh\nset -e\nif [ \"\$1\" = remove ] || [ \"\$1\" = purge ]; then /usr/bin/macbat uninstall || true; fi\nexit 0\n' > \$d/DEBIAN/prerm

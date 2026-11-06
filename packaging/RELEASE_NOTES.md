@@ -1,24 +1,26 @@
-**macbat 0.3.0** — native, dependency-free builds for Linux (Intel MacBooks) and macOS.
+**macbat 0.4.0** — fan control, plus a fix for adapter toggling at the charge limit.
 
-### Install
+### Install / upgrade
 ```sh
 curl -fsSL https://raw.githubusercontent.com/neuralfoundry-coder/macbat/main/install.sh | sudo sh
 ```
-or grab a package below: `macbat_0.3.0_amd64.deb` (Ubuntu/Debian on Intel Macs) · `macbat-0.3.0-macos-universal.pkg` (macOS, Apple Silicon + Intel; unsigned — right-click → Open, or `sudo installer -pkg … -target /`).
+Upgrading keeps `/etc/macbat.conf` (limit, auto-discharge, …). Or grab a package below: `macbat_0.4.0_amd64.deb` (Ubuntu/Debian on Intel Macs) · `macbat-0.4.0-macos-universal.pkg` (macOS, Apple Silicon + Intel; unsigned — right-click → Open, or `sudo installer -pkg … -target /`).
 
 ### What's new
-- Rewritten in C: a single static binary per platform, no Python or other runtime needed.
-- `macbat` opens a retro **settings screen** covering battery limit / auto-discharge, screen-off-when-idle, display & keyboard brightness, lid / power button / idle sleep, SATA link power (ALPM) and disk spin-down, Wi-Fi power save, USB autosuspend, CPU governor & turbo, PCIe ASPM (Linux) — and display / system / disk sleep, Power Nap, low power mode (macOS, via `pmset`). Changes apply immediately and survive reboots (TLP-aware on Linux).
-- Retro status page (`macbat status`), green or amber (`MACBAT_THEME=amber`), `--plain` / `--json` for scripts.
-- Battery health is shown as "n/a (uncalibrated)" when the fuel gauge reports more than the design capacity, instead of a misleading >100 %.
-- Refuses to touch charging while AlDente / Battery Toolkit is running (override with `--force`).
-- `.deb` and `.pkg` packages, one-line installer with SHA-256 verification.
+- **Fan control.** `macbat fan` shows every fan's speed, min / max, target and who controls it (SMC, mbpfan, macbat), plus the CPU temperature. `sudo macbat fan set 3000` (RPM) or `sudo macbat fan set 50%` (share of the fan's min..max) pins a speed; `sudo macbat fan auto` returns to automatic control. Also on the settings screen (new FANS section) and in `macbat status` / `--json`.
+  - Speeds are always clamped to the fan's own min..max: fans are never slowed below the SMC minimum and can't be switched off.
+  - The service re-applies the speed after boot / resume, hands the fans back to automatic control before sleep, on `restore` and when it stops, and has a **thermal guard**: at 90 °C CPU it switches to automatic until the CPU is back at 75 °C (Linux, Intel macOS).
+  - **mbpfan:** left alone until you ask for a manual speed; then macbat stops and disables it (and says so), and `macbat fan auto` / `macbat uninstall` enable and start it again.
+  - Linux uses the `applesmc` fan files (tested on a MacBook Pro 2015). **macOS fan writes are experimental** — implemented (Apple Silicon `F<n>Md` / `Ftst`, Intel `FS!`) but not tested on real hardware; reading fans on macOS is tested.
+- **Fix: auto-discharge no longer toggles the adapter every 30 s** when the battery sits at the limit / limit + 1 % (seen with the SMC hardware limit on Linux). Auto-discharge now starts at limit + `hysteresis` (default 3 %) and still drains down to the limit.
+- Settings screen: the key help line fits again when not running as root.
+- New screenshots in the README (status, settings, fan page) — captured from a real MacBook Pro 2015 with `packaging/capture.py` + `packaging/ansi2svg.py`, which can now record the full-screen settings screen.
 
 ### Assets
 | file | for |
 |---|---|
 | `macbat-linux-x86_64` | static Linux binary (Intel Macs) |
-| `macbat_0.3.0_amd64.deb` | Debian / Ubuntu package |
+| `macbat_0.4.0_amd64.deb` | Debian / Ubuntu package |
 | `macbat-macos-universal` | macOS binary (arm64 + x86_64, ad-hoc signed) |
-| `macbat-0.3.0-macos-universal.pkg` | macOS installer package |
+| `macbat-0.4.0-macos-universal.pkg` | macOS installer package |
 | `install.sh`, `SHA256SUMS` | one-line installer and checksums |
