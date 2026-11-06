@@ -1,2 +1,4 @@
+/macbat
+dist/
 __pycache__/
 *.pyc
