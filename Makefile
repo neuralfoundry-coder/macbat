@@ -16,10 +16,13 @@ endif
 install: macbat          # sudo make install
 	./macbat install
 
-release:                 # all assets into dist/ (macOS host with Docker)
+app: macbat              # MacBat.app, the macOS menu bar app, into dist/ (macOS 13+ SDK, Swift)
+	mkdir -p dist && cp macbat dist/macbat-macos-universal && packaging/build-app.sh
+
+release:                 # all assets into dist/ (macOS host with Docker; MACBAT_NOTARIZE=1 to notarize)
 	packaging/release.sh
 
 clean:
 	rm -rf macbat dist
 
-.PHONY: all install release clean
+.PHONY: all install app release clean

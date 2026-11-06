@@ -1,27 +1,28 @@
-**macbat 0.5.0** — themes, and a clean modern look by default.
+**macbat 0.6.0** — MacBat, a menu bar app for macOS, and a one-time top-up to 100 %.
 
 ### Install / upgrade
 ```sh
 curl -fsSL https://raw.githubusercontent.com/neuralfoundry-coder/macbat/main/install.sh | sudo sh
 ```
-Upgrading keeps `/etc/macbat.conf` (limit, auto-discharge, fan, …). Or grab a package below: `macbat_0.5.0_amd64.deb` (Ubuntu/Debian on Intel Macs) · `macbat-0.5.0-macos-universal.pkg` (macOS, Apple Silicon + Intel; unsigned — right-click → Open, or `sudo installer -pkg … -target /`).
+On macOS this now also installs **/Applications/MacBat.app** and starts it (`MACBAT_NO_APP=1` skips it). Upgrading keeps `/etc/macbat.conf`. Packages: `macbat_0.6.0_amd64.deb` (Ubuntu/Debian on Intel Macs) · `macbat-0.6.0-macos-universal.pkg` (the tool + MacBat.app; the package itself is unsigned — right-click → Open) · `MacBat-app.zip` (the app alone).
 
 ### What's new
-- **Themes** for `macbat status`, `macbat fan` and the settings screen:
-  - `modern` — **the new default**: rounded frame, slim gauge, normal-weight text, one blue accent that reads on dark and light terminals.
-  - `mono` (no colour), `ocean` (blue / aqua, gradient gauge), `candy` (pastel, dotted gauge), `nord` (Nord palette).
-  - `retro` and `amber` — the green / amber CRT look of 0.3 and 0.4, unchanged.
-- **Choosing a theme**: `--theme NAME` > `MACBAT_THEME` > `theme=` in `/etc/macbat.conf` > `modern`. Save one with `sudo macbat theme NAME` (or `default`), preview all with `macbat theme --list`, or pick it on the settings screen (*Appearance → Theme*: ← → previews live, even without sudo). Unknown names stop with the list of themes. Configs without `theme=` get the new default.
-- **Colours follow the terminal**: truecolor (`COLORTERM=truecolor`), 256 colours, 16 colours on the Linux console (`TERM=linux`, fbterm / VT), none with `NO_COLOR`; `MACBAT_COLORS=16|256|truecolor|none` overrides. Every theme only uses glyphs the console's Terminus font has.
-- `--plain` and `--json` output is unchanged.
-- Screenshot tooling: `packaging/ansi2svg.py` understands 256 / truecolor and renders plain terminal windows (dark / light / VGA console) besides the CRT; `packaging/capture.py` no longer hangs when it has to stop a full-screen program.
-- Fix: value text on the settings screen could be garbled on macOS (byte-wise `tolower` on UTF-8).
+- **MacBat.app** (macOS 13+, Apple Silicon + Intel): a template battery icon in the menu bar (charge level; bolt when charging, pause when held at the limit, arrow when auto-discharging; optional percentage) and a panel with the charge %, state, time left, a gauge with the limit, a charge-limit slider, auto-discharge, energy mode / Low Power Mode, **Top up to 100 % once**, battery details (power source and adapter watts, health, cycles, temperature, voltage / current), fans (auto / fixed speed), and a button that opens the full settings screen in Terminal. English and Korean. Starts at login (toggle in its ⋯ menu). The accent colour follows the macbat theme.
+  - Reads as the normal user (`macbat status --json`). Changes go to the root service over **`/var/run/macbat.sock`** — root-owned, mode 0660, group admin, peer credentials checked on every connection (root, or an admin logged in at the screen), a fixed list of validated requests, each one logged. Without the service it falls back to the standard administrator password prompt.
+  - With AlDente / Battery Toolkit running it shows that and stays read-only, unless you choose *Take over…*.
+  - Signed with a Developer ID (hardened runtime) and **notarized**; the ticket is stapled to the app. The `macbat` binaries for macOS are Developer ID signed too.
+  - Not tested on real hardware: writes from the app on macOS (the only Apple Silicon Mac available runs AlDente and stays read-only). The control socket protocol was tested with the Linux build.
+- **`sudo macbat topup`**: charge to 100 % once, then back to the limit (`topup off` cancels; the service ends it at 100 % or after 12 hours). Also in the app.
+- **Control socket** for scripts and the app, on Linux too (`/run/macbat.sock`, group sudo / admin / wheel): `printf 'limit 85\n' | nc -U /run/macbat.sock`.
+- macOS settings screen: *Energy mode* (automatic / low power / high power) on macOS versions that use `powermode`.
+- `macbat status --json`: `theme` and `conf.topup`.
 
 ### Assets
 | file | for |
 |---|---|
 | `macbat-linux-x86_64` | static Linux binary (Intel Macs) |
-| `macbat_0.5.0_amd64.deb` | Debian / Ubuntu package |
-| `macbat-macos-universal` | macOS binary (arm64 + x86_64, ad-hoc signed) |
-| `macbat-0.5.0-macos-universal.pkg` | macOS installer package |
+| `macbat_0.6.0_amd64.deb` | Debian / Ubuntu package |
+| `macbat-macos-universal` | macOS command-line tool (arm64 + x86_64, Developer ID signed) |
+| `MacBat-app.zip` | MacBat.app, the menu bar app (notarized) |
+| `macbat-0.6.0-macos-universal.pkg` | macOS installer package: tool + app |
 | `install.sh`, `SHA256SUMS` | one-line installer and checksums |

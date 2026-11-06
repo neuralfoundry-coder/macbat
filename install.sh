@@ -5,6 +5,7 @@
 #
 # env:  MACBAT_VERSION=0.2.0   install a specific release (default: latest)
 #       MACBAT_DRY_RUN=1       download + verify only, change nothing (no root needed)
+#       MACBAT_NO_APP=1        macOS: skip the MacBat menu bar app (/Applications/MacBat.app)
 # extra args go to 'macbat install', e.g.:  ... | sudo sh -s -- --force
 set -eu
 REPO="neuralfoundry-coder/macbat"
@@ -43,6 +44,15 @@ got=$(sha256 "$tmp/macbat")
 say "checksum OK"
 chmod 755 "$tmp/macbat"
 v=$("$tmp/macbat" --version 2>/dev/null) || fail "the downloaded binary does not run on this machine"
+app=0
+if [ "$os" = Darwin ] && [ "${MACBAT_NO_APP:-0}" != 1 ]; then   # menu bar app (releases from 0.6 on)
+  if fetch "$base/MacBat-app.zip" "$tmp/app.zip" 2>/dev/null; then
+    want=$(awk '$2=="MacBat-app.zip" || $2=="*MacBat-app.zip" {print $1}' "$tmp/SHA256SUMS")
+    { [ -n "$want" ] && [ "$want" = "$(sha256 "$tmp/app.zip")" ]; } || fail "checksum mismatch for MacBat-app.zip"
+    say "checksum OK (MacBat.app)"
+    app=1
+  else say "no menu bar app in this release - installing the command-line tool only"; fi
+fi
 if [ "${MACBAT_DRY_RUN:-0}" = 1 ]; then say "dry run: $v verified, nothing installed"; exit 0; fi
 
 [ "$(id -u)" = 0 ] || fail "please run as root:  curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | sudo sh"
@@ -52,4 +62,11 @@ chmod 755 /usr/local/bin/macbat.new
 mv -f /usr/local/bin/macbat.new /usr/local/bin/macbat
 say "installed /usr/local/bin/macbat ($v)"
 /usr/local/bin/macbat install "$@"
+if [ "$app" = 1 ]; then
+  rm -rf /Applications/MacBat.app
+  ditto -x -k "$tmp/app.zip" /Applications
+  say "installed /Applications/MacBat.app"
+  u=$(stat -f %Su /dev/console 2>/dev/null || true)   # start it for the user at the screen; it adds itself to login items
+  if [ -n "$u" ] && [ "$u" != root ]; then launchctl asuser "$(id -u "$u")" sudo -u "$u" open -g /Applications/MacBat.app 2>/dev/null || true; fi
+fi
 say "done - run 'macbat' to see the battery status"
