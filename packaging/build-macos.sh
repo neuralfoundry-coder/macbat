@@ -15,8 +15,17 @@ cat > "$w/scripts/postinstall" <<'PI'
 exit 0
 PI
 chmod 755 "$w/scripts/postinstall"
-xattr -cr "$w/root" "$w/scripts"                       # no AppleDouble ._ files in the payload
-COPYFILE_DISABLE=1 pkgbuild --quiet --root "$w/root" --scripts "$w/scripts" --identifier com.neuralfoundry.macbat \
-         --version "$VERSION" --install-location / "dist/macbat-$VERSION-macos-universal.pkg"
+# macOS tags every new file with com.apple.provenance (cannot be removed) and pkgbuild turns
+# xattrs into AppleDouble "._" entries. Build with pkgbuild, then replace Payload/Bom with
+# clean ones made without extended attributes.
+pkgbuild --quiet --root "$w/root" --scripts "$w/scripts" --identifier com.neuralfoundry.macbat \
+         --version "$VERSION" --install-location / "$w/raw.pkg"
+pkgutil --expand "$w/raw.pkg" "$w/x"
+(cd "$w/root" && find . | COPYFILE_DISABLE=1 cpio -o --quiet --format odc -R 0:80 | gzip -9 -c) > "$w/x/Payload"
+mkbom -s "$w/root" "$w/x/Bom"                  # -s: every entry owned by root:admin
+nfiles=$(cd "$w/root" && find . | wc -l | tr -d ' ')
+sed -i '' "s/numberOfFiles=\"[0-9]*\"/numberOfFiles=\"$nfiles\"/" "$w/x/PackageInfo"
+rm -f "dist/macbat-$VERSION-macos-universal.pkg"
+pkgutil --flatten "$w/x" "dist/macbat-$VERSION-macos-universal.pkg"
 rm -rf "$w"
 ls -l dist/macbat-macos-universal "dist/macbat-$VERSION-macos-universal.pkg"
