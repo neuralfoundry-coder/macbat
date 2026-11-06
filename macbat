@@ -1,0 +1,1109 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""macbat - battery charge limiter and battery status tool for Apple laptops.
+
+Platforms
+  * Linux on Intel MacBooks (applesmc)   - hardware limit via SMC key BCLM,
+                                            auto-discharge via ACEN / CH0I
+  * macOS on Apple Silicon               - limit via CHTE (or CH0B/CH0C),
+                                            auto-discharge via CHIE (or CH0I)
+  * macOS on Intel                       - BCLM / CH0I (experimental)
+
+Run `macbat --help` for usage.
+"""
+from __future__ import annotations
+
+import argparse
+import ctypes
+import fcntl
+import json
+import os
+import platform
+import plistlib
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+VERSION = "0.1.0"
+CONF_PATH = "/etc/macbat.conf"
+STATE_PATH = "/run/macbat.json" if sys.platform.startswith("linux") else "/var/run/macbat.json"
+LOCK_PATH = "/run/macbat.lock" if sys.platform.startswith("linux") else "/var/run/macbat.lock"
+DEFAULTS = {"limit": 80, "auto_discharge": True, "hysteresis": 3, "interval": 30}
+SAFETY_FLOOR = 10          # below this %: never block charging, never bypass the adapter
+INSTALL_BIN = "/usr/local/bin/macbat"
+SYSTEMD_UNIT = "/etc/systemd/system/macbat.service"
+SLEEP_HOOK = "/usr/lib/systemd/system-sleep/macbat"
+LAUNCHD_LABEL = "com.neuralfoundry.macbat"
+LAUNCHD_PLIST = f"/Library/LaunchDaemons/{LAUNCHD_LABEL}.plist"
+IS_LINUX = sys.platform.startswith("linux")
+IS_MAC = sys.platform == "darwin"
+
+
+# --------------------------------------------------------------------------- helpers
+def die(msg: str, code: int = 1):
+    print(f"macbat: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def need_root(what: str):
+    if os.geteuid() != 0:
+        die(f"'{what}' needs root - try: sudo macbat {what}")
+
+
+def rd(path: str, default=None):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def rd_int(path: str):
+    v = rd(path)
+    try:
+        return int(v) if v is not None else None
+    except ValueError:
+        return None
+
+
+def run(*cmd, check=False) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, check=check)
+
+
+def log(msg: str):
+    print(time.strftime("%Y-%m-%d %H:%M:%S ") + msg, flush=True)
+
+
+def load_conf() -> dict:
+    conf = dict(DEFAULTS)
+    text = rd(CONF_PATH, "") or ""
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if "=" not in line:
+            continue
+        k, v = (s.strip() for s in line.split("=", 1))
+        if k == "auto_discharge":
+            conf[k] = v.lower() in ("1", "on", "yes", "true")
+        elif k in ("limit", "hysteresis", "interval"):
+            try:
+                conf[k] = int(v)
+            except ValueError:
+                pass
+    conf["limit"] = max(20, min(100, conf["limit"]))
+    conf["hysteresis"] = max(1, min(20, conf["hysteresis"]))
+    conf["interval"] = max(5, min(600, conf["interval"]))
+    return conf
+
+
+def save_conf(conf: dict):
+    body = (
+        "# macbat configuration (re-read automatically by the macbat service)\n"
+        f"limit={conf['limit']}\n"
+        f"auto_discharge={'on' if conf['auto_discharge'] else 'off'}\n"
+        f"hysteresis={conf['hysteresis']}\n"
+        f"interval={conf['interval']}\n"
+    )
+    tmp = CONF_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(body)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, CONF_PATH)
+
+
+class FileLock:
+    """Serialise SMC writes between the daemon and CLI invocations."""
+
+    def __enter__(self):
+        self.f = open(LOCK_PATH, "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+# --------------------------------------------------------------------------- SMC value codecs
+def decode(typ: str, data: bytes, le: bool):
+    t = typ.strip()
+    e = "<" if le else ">"
+    try:
+        if t in ("ui8", "si8", "flag", "hex_") and len(data) == 1:
+            return struct.unpack("b" if t == "si8" else "B", data)[0]
+        if t in ("ui16", "si16") and len(data) == 2:
+            return struct.unpack(e + ("h" if t == "si16" else "H"), data)[0]
+        if t in ("ui32", "si32") and len(data) == 4:
+            return struct.unpack(e + ("i" if t == "si32" else "I"), data)[0]
+        if t == "flt" and len(data) == 4:
+            return round(struct.unpack(e + "f", data)[0], 2)
+        if t == "sp78" and len(data) == 2:
+            return round(struct.unpack(e + "h", data)[0] / 256.0, 2)
+    except struct.error:
+        pass
+    return data.hex()
+
+
+# --------------------------------------------------------------------------- SMC: Linux (applesmc)
+class LinuxSMC:
+    """Reads go through the applesmc driver (safe, concurrent with mbpfan etc).
+    Writes go straight to the SMC I/O ports (0x300/0x304) via /dev/port, with the
+    applesmc driver unloaded so nothing else talks to the SMC at the same time.
+    The port protocol mirrors drivers/hwmon/applesmc.c."""
+
+    little_endian = False
+    SYS = "/sys/devices/platform/applesmc.768"
+    DATA, CMD = 0x300, 0x304
+    READ, WRITE = 0x10, 0x11
+    ST_AWAIT, ST_IBCLOSED, ST_BUSY = 0x01, 0x02, 0x04
+
+    def __init__(self):
+        self._idx: dict = {}
+
+    @classmethod
+    def available(cls) -> bool:
+        return os.path.isdir(cls.SYS)
+
+    # ---- driver-based reads (need root: key_at_index is root-writable)
+    def _name_at(self, i: int) -> str:
+        with open(f"{self.SYS}/key_at_index", "w") as f:
+            f.write(str(i))
+        with open(f"{self.SYS}/key_at_index_name") as f:
+            return f.read().rstrip("\n")[:4]
+
+    def _index(self, key: str):
+        if key in self._idx:
+            return self._idx[key]
+        n = rd_int(f"{self.SYS}/key_count") or 0
+        lo, hi, found = 0, n - 1, None
+        while lo <= hi:                      # SMC keys are sorted by their 32-bit value
+            mid = (lo + hi) // 2
+            name = self._name_at(mid)
+            if name == key:
+                found = mid
+                break
+            if name.encode("latin-1") < key.encode("latin-1"):
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if found is None:                    # fall back to a linear scan, just in case
+            for i in range(n):
+                if self._name_at(i) == key:
+                    found = i
+                    break
+        self._idx[key] = found
+        return found
+
+    def read(self, key: str):
+        """-> (type, bytes) or None if the key does not exist."""
+        i = self._index(key)
+        if i is None:
+            return None
+        with open(f"{self.SYS}/key_at_index", "w") as f:
+            f.write(str(i))
+        if self._name_at(i) != key:
+            self._idx.pop(key, None)
+            return None
+        typ = rd(f"{self.SYS}/key_at_index_type", "") or ""
+        with open(f"{self.SYS}/key_at_index_data", "rb") as f:
+            return typ, f.read()
+
+    # ---- raw port I/O
+    def _inb(self, fd, p):
+        return os.pread(fd, 1, p)[0]
+
+    def _outb(self, fd, v, p):
+        os.pwrite(fd, bytes([v]), p)
+
+    def _wait(self, fd, val, mask):
+        us = 16
+        while us < 0x20000:
+            if self._inb(fd, self.CMD) & mask == val:
+                return
+            time.sleep(us / 1e6)
+            us <<= 1
+        raise IOError("SMC timeout (status=%#04x)" % self._inb(fd, self.CMD))
+
+    def _send_byte(self, fd, b, port):
+        self._wait(fd, 0, self.ST_IBCLOSED)
+        self._wait(fd, self.ST_BUSY, self.ST_BUSY)
+        self._outb(fd, b, port)
+
+    def _send_cmd(self, fd, c):
+        self._wait(fd, 0, self.ST_IBCLOSED)
+        self._outb(fd, c, self.CMD)
+
+    def _sane(self, fd):
+        try:
+            self._wait(fd, 0, self.ST_BUSY)
+            return
+        except IOError:
+            pass
+        self._send_cmd(fd, self.READ)
+        self._wait(fd, 0, self.ST_BUSY)
+
+    def _port_read(self, fd, key, n):
+        self._sane(fd)
+        self._send_cmd(fd, self.READ)
+        for ch in key.encode("latin-1"):
+            self._send_byte(fd, ch, self.DATA)
+        self._send_byte(fd, n, self.DATA)
+        out = bytearray()
+        for _ in range(n):
+            self._wait(fd, self.ST_AWAIT | self.ST_BUSY, self.ST_AWAIT | self.ST_BUSY)
+            out.append(self._inb(fd, self.DATA))
+        for _ in range(16):
+            time.sleep(16e-6)
+            if not self._inb(fd, self.CMD) & self.ST_AWAIT:
+                break
+            self._inb(fd, self.DATA)
+        self._wait(fd, 0, self.ST_BUSY)
+        return bytes(out)
+
+    def _port_write(self, fd, key, data):
+        self._sane(fd)
+        self._send_cmd(fd, self.WRITE)
+        for ch in key.encode("latin-1"):
+            self._send_byte(fd, ch, self.DATA)
+        self._send_byte(fd, len(data), self.DATA)
+        for b in data:
+            self._send_byte(fd, b, self.DATA)
+        self._wait(fd, 0, self.ST_BUSY)
+
+    @staticmethod
+    def _pause_mbpfan() -> bool:
+        """mbpfan polls the SMC every second and keeps applesmc sysfs files open, so it must
+        be stopped (and later restarted) around a raw write. Never block forever on systemd:
+        if the stop job does not finish quickly, freeze the process instead."""
+        if run("systemctl", "is-active", "--quiet", "mbpfan").returncode != 0:
+            return False
+        try:
+            subprocess.run(["systemctl", "stop", "mbpfan"], capture_output=True, timeout=20)
+        except subprocess.TimeoutExpired:
+            run("pkill", "-STOP", "-x", "mbpfan")
+        return True
+
+    def write(self, items):
+        """items: list of (key, bytes). Verifies each write by reading it back."""
+        mbpfan = self._pause_mbpfan()
+        unloaded = run("modprobe", "-r", "applesmc").returncode == 0
+        bad = []
+        try:
+            fd = os.open("/dev/port", os.O_RDWR)
+            try:
+                for key, data in items:
+                    self._port_write(fd, key, data)
+                    back = self._port_read(fd, key, len(data))
+                    if back != data:
+                        bad.append(f"{key}: wrote {data.hex()} read {back.hex()}")
+            finally:
+                os.close(fd)
+        finally:
+            if unloaded:
+                run("modprobe", "applesmc")
+                for _ in range(50):
+                    if os.path.exists(f"{self.SYS}/key_count"):
+                        break
+                    time.sleep(0.1)
+            if mbpfan:
+                # --no-block: never wait on systemd's job queue (we may be inside our own stop job)
+                run("systemctl", "restart", "--no-block", "mbpfan")
+            self._idx.clear()
+        if bad:
+            raise IOError("SMC write verify failed: " + "; ".join(bad))
+
+
+# --------------------------------------------------------------------------- SMC: macOS (IOKit)
+IOKIT = "/System/Library/Frameworks/IOKit.framework/IOKit"
+CORE_FOUNDATION = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+
+
+class _Vers(ctypes.Structure):
+    _fields_ = [("major", ctypes.c_uint8), ("minor", ctypes.c_uint8), ("build", ctypes.c_uint8),
+                ("reserved", ctypes.c_uint8), ("release", ctypes.c_uint16)]
+
+
+class _PLimit(ctypes.Structure):
+    _fields_ = [("version", ctypes.c_uint16), ("length", ctypes.c_uint16), ("cpu", ctypes.c_uint32),
+                ("gpu", ctypes.c_uint32), ("mem", ctypes.c_uint32)]
+
+
+class _KeyInfo(ctypes.Structure):
+    _fields_ = [("dataSize", ctypes.c_uint32), ("dataType", ctypes.c_uint32), ("dataAttributes", ctypes.c_uint8)]
+
+
+class _KeyData(ctypes.Structure):
+    _fields_ = [("key", ctypes.c_uint32), ("vers", _Vers), ("pLimitData", _PLimit), ("keyInfo", _KeyInfo),
+                ("result", ctypes.c_uint8), ("status", ctypes.c_uint8), ("data8", ctypes.c_uint8),
+                ("data32", ctypes.c_uint32), ("bytes", ctypes.c_uint8 * 32)]
+
+
+class MacSMC:
+    """AppleSMC user client (same structure as smcFanControl's smc.c). Reads work as any
+    user; writes need root."""
+
+    little_endian = platform.machine() == "arm64"
+    CMD_READ_BYTES, CMD_WRITE_BYTES, CMD_READ_KEYINFO = 5, 6, 9
+
+    def __init__(self):
+        assert ctypes.sizeof(_KeyData) == 80
+        io = ctypes.cdll.LoadLibrary(IOKIT)
+        libc = ctypes.cdll.LoadLibrary("/usr/lib/libSystem.B.dylib")
+        io.IOServiceMatching.restype = ctypes.c_void_p
+        io.IOServiceMatching.argtypes = [ctypes.c_char_p]
+        io.IOServiceGetMatchingService.restype = ctypes.c_uint32
+        io.IOServiceGetMatchingService.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+        io.IOServiceOpen.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)]
+        io.IOConnectCallStructMethod.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_size_t,
+                                                 ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+        self.io = io
+        task = ctypes.c_uint32.in_dll(libc, "mach_task_self_").value
+        svc = io.IOServiceGetMatchingService(0, io.IOServiceMatching(b"AppleSMC"))
+        if not svc:
+            raise OSError("AppleSMC service not found")
+        self.conn = ctypes.c_uint32()
+        kr = io.IOServiceOpen(svc, task, 0, ctypes.byref(self.conn))
+        if kr:
+            raise OSError(f"IOServiceOpen(AppleSMC) failed: {kr:#x}")
+        self._info: dict = {}
+
+    @staticmethod
+    def available() -> bool:
+        return IS_MAC
+
+    def _call(self, inp: _KeyData) -> _KeyData:
+        out = _KeyData()
+        n = ctypes.c_size_t(ctypes.sizeof(out))
+        kr = self.io.IOConnectCallStructMethod(self.conn.value, 2, ctypes.byref(inp), ctypes.sizeof(inp),
+                                               ctypes.byref(out), ctypes.byref(n))
+        if kr:
+            raise OSError(f"IOConnectCallStructMethod failed: {kr:#x}" +
+                          (" (not privileged - use sudo)" if kr == 0xE00002C1 else ""))
+        return out
+
+    def _keyinfo(self, key: str):
+        if key not in self._info:
+            k = int.from_bytes(key.encode("latin-1"), "big")
+            o = self._call(_KeyData(key=k, data8=self.CMD_READ_KEYINFO))
+            self._info[key] = None if o.result else (o.keyInfo.dataSize, o.keyInfo.dataType)
+        return self._info[key]
+
+    def read(self, key: str):
+        info = self._keyinfo(key)
+        if info is None:
+            return None
+        size, typ = info
+        inp = _KeyData(key=int.from_bytes(key.encode("latin-1"), "big"), data8=self.CMD_READ_BYTES)
+        inp.keyInfo.dataSize = size
+        o = self._call(inp)
+        if o.result:
+            return None
+        return typ.to_bytes(4, "big").decode("latin-1"), bytes(o.bytes[:size])
+
+    def write(self, items):
+        bad = []
+        for key, data in items:
+            info = self._keyinfo(key)
+            if info is None:
+                raise OSError(f"SMC key {key} not present")
+            if info[0] != len(data):
+                raise OSError(f"SMC key {key}: size {info[0]} != {len(data)}")
+            inp = _KeyData(key=int.from_bytes(key.encode("latin-1"), "big"), data8=self.CMD_WRITE_BYTES)
+            inp.keyInfo.dataSize = len(data)
+            for i, b in enumerate(data):
+                inp.bytes[i] = b
+            o = self._call(inp)
+            if o.result:
+                bad.append(f"{key}: SMC result {o.result}")
+                continue
+            back = self.read(key)
+            if back is None or back[1] != data:
+                bad.append(f"{key}: wrote {data.hex()} read {back[1].hex() if back else '?'}")
+        if bad:
+            raise IOError("SMC write failed: " + "; ".join(bad))
+
+
+class MacSleepWatcher:
+    """IORegisterForSystemPower via ctypes: lets the daemon restore normal charging
+    right before the Mac sleeps (the daemon cannot act while asleep)."""
+
+    CAN_SLEEP, WILL_SLEEP, HAS_POWERED_ON = 0xE0000270, 0xE0000280, 0xE0000300
+
+    def __init__(self, on_sleep, on_wake):
+        self.on_sleep, self.on_wake = on_sleep, on_wake
+        io = ctypes.cdll.LoadLibrary(IOKIT)
+        cf = ctypes.cdll.LoadLibrary(CORE_FOUNDATION)
+        CB = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p)
+        io.IORegisterForSystemPower.restype = ctypes.c_uint32
+        io.IORegisterForSystemPower.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), CB,
+                                                ctypes.POINTER(ctypes.c_uint32)]
+        io.IONotificationPortGetRunLoopSource.restype = ctypes.c_void_p
+        io.IONotificationPortGetRunLoopSource.argtypes = [ctypes.c_void_p]
+        io.IOAllowPowerChange.restype = ctypes.c_int
+        io.IOAllowPowerChange.argtypes = [ctypes.c_uint32, ctypes.c_long]
+        cf.CFRunLoopGetCurrent.restype = ctypes.c_void_p
+        cf.CFRunLoopAddSource.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        cf.CFRunLoopRunInMode.restype = ctypes.c_int32
+        cf.CFRunLoopRunInMode.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_bool]
+        self.io, self.cf = io, cf
+        self.mode = ctypes.c_void_p.in_dll(cf, "kCFRunLoopDefaultMode")
+        self._cb = CB(self._handle)                       # keep a reference
+        self.port, self.notifier = ctypes.c_void_p(), ctypes.c_uint32()
+        self.root = io.IORegisterForSystemPower(None, ctypes.byref(self.port), self._cb, ctypes.byref(self.notifier))
+        if not self.root:
+            raise OSError("IORegisterForSystemPower failed")
+        cf.CFRunLoopAddSource(cf.CFRunLoopGetCurrent(), io.IONotificationPortGetRunLoopSource(self.port), self.mode)
+
+    def _handle(self, refcon, service, msg, arg):
+        try:
+            if msg == self.WILL_SLEEP:
+                self.on_sleep()
+            elif msg == self.HAS_POWERED_ON:
+                self.on_wake()
+        except Exception as e:  # never block sleep because of us
+            log(f"sleep handler error: {e}")
+        finally:
+            if msg in (self.CAN_SLEEP, self.WILL_SLEEP):
+                self.io.IOAllowPowerChange(self.root, arg or 0)
+
+    def run(self, seconds: float):
+        self.cf.CFRunLoopRunInMode(self.mode, seconds, False)
+
+
+# --------------------------------------------------------------------------- platform: battery + controls
+class Platform:
+    """Common control logic on top of a platform SMC + battery reader."""
+
+    smc = None
+    name = "?"
+
+    # -- capabilities, discovered from the SMC key table
+    def caps(self) -> dict:
+        h = lambda k: self.smc.read(k) is not None  # noqa: E731
+        c = {
+            "hw_limit": "BCLM" if h("BCLM") else None,
+            "inhibit": "CHTE" if h("CHTE") else ("CH0B" if h("CH0B") and h("CH0C") else None),
+            "discharge": None,
+        }
+        for key in self.DISCHARGE_KEYS:
+            if h(key):
+                c["discharge"] = key
+                break
+        return c
+
+    def smc_val(self, key):
+        r = self.smc.read(key)
+        return None if r is None else decode(r[0], r[1], self.smc.little_endian)
+
+    # -- state of the control keys
+    def control_state(self, caps) -> dict:
+        s = {"hw_limit": None, "charging_blocked": None, "adapter_off": None}
+        if caps["hw_limit"]:
+            s["hw_limit"] = self.smc_val("BCLM")
+        if caps["inhibit"] == "CHTE":
+            r = self.smc.read("CHTE")
+            s["charging_blocked"] = any(r[1]) if r else None
+        elif caps["inhibit"] == "CH0B":
+            r = self.smc.read("CH0B")
+            s["charging_blocked"] = bool(r and r[1][0])
+        d = caps["discharge"]
+        if d:
+            r = self.smc.read(d)
+            if r:
+                v = r[1][0]
+                s["adapter_off"] = (v == 0) if d == "ACEN" else (bool(v & 0x08) if d == "CHIE" else bool(v))
+        return s
+
+    # -- write helpers (return list of (key, bytes))
+    @staticmethod
+    def w_hw_limit(pct):
+        return [("BCLM", bytes([pct]))]
+
+    @staticmethod
+    def w_charging(caps, enabled: bool):
+        if caps["inhibit"] == "CHTE":
+            return [("CHTE", (b"\x00" if enabled else b"\x01") + b"\x00\x00\x00")]
+        if caps["inhibit"] == "CH0B":
+            v = b"\x00" if enabled else b"\x02"
+            return [("CH0B", v), ("CH0C", v)]
+        return []
+
+    @staticmethod
+    def w_adapter(caps, enabled: bool):
+        d = caps["discharge"]
+        if d == "ACEN":
+            return [("ACEN", b"\x01" if enabled else b"\x00")]
+        if d == "CHIE":
+            return [("CHIE", b"\x00" if enabled else b"\x08")]
+        if d == "CH0I":
+            return [("CH0I", b"\x00" if enabled else b"\x01")]
+        return []
+
+    def write(self, items):
+        if items:
+            with FileLock():
+                self.smc.write(items)
+
+
+class LinuxPlatform(Platform):
+    DISCHARGE_KEYS = ("ACEN", "CH0I")   # ACEN=0 verified on MacBookPro12,1
+
+    def __init__(self):
+        self.smc = LinuxSMC()
+        self.name = "Linux · Intel Mac (applesmc)"
+        self.model = rd("/sys/class/dmi/id/product_name", "?")
+
+    def _supplies(self):
+        base = "/sys/class/power_supply"
+        bat = ac = None
+        for n in sorted(os.listdir(base)) if os.path.isdir(base) else []:
+            t = rd(f"{base}/{n}/type")
+            if t == "Battery" and bat is None and rd(f"{base}/{n}/present", "1") == "1":
+                bat = f"{base}/{n}"
+            elif t == "Mains" and ac is None:
+                ac = f"{base}/{n}"
+        return bat, ac
+
+    def battery(self) -> dict:
+        bat, ac = self._supplies()
+        if not bat:
+            die("no battery found")
+        b = {"percent": rd_int(f"{bat}/capacity"), "state": (rd(f"{bat}/status") or "?").lower(),
+             "ac": rd(f"{ac}/online") == "1" if ac else None, "cycles": rd_int(f"{bat}/cycle_count"),
+             "adapter_w": None}
+        uv, ua = rd_int(f"{bat}/voltage_now"), rd_int(f"{bat}/current_now")
+        b["voltage"] = uv / 1e6 if uv else None
+        cur = ua / 1e6 if ua is not None else None
+        if cur is not None and b["state"] == "discharging":
+            cur = -abs(cur)
+        b["current"] = cur
+        b["power"] = (b["voltage"] * cur) if (b["voltage"] and cur is not None) else None
+        t = rd_int(f"{bat}/temp")
+        b["temp_c"] = t / 10 if t is not None else None
+        if os.path.exists(f"{bat}/charge_full"):
+            now, full, design = (rd_int(f"{bat}/charge_now"), rd_int(f"{bat}/charge_full"),
+                                 rd_int(f"{bat}/charge_full_design"))
+            b["full_mah"] = full // 1000 if full else None
+            b["design_mah"] = design // 1000 if design else None
+            rate = abs(ua) if ua else 0
+        else:  # energy_* (uWh) based batteries
+            now, full, design = (rd_int(f"{bat}/energy_now"), rd_int(f"{bat}/energy_full"),
+                                 rd_int(f"{bat}/energy_full_design"))
+            b["full_mah"] = b["design_mah"] = None
+            rate = abs(rd_int(f"{bat}/power_now") or 0)
+        b["health"] = round(full / design * 100, 1) if full and design else None
+        b["time_to_empty"] = b["time_to_full"] = None
+        if rate and now is not None:
+            if b["state"] == "discharging":
+                b["time_to_empty"] = int(now / rate * 60)
+            elif b["state"] == "charging" and full:
+                b["time_to_full"] = int(max(full - now, 0) / rate * 60)
+        return b
+
+
+class MacPlatform(Platform):
+    DISCHARGE_KEYS = ("CHIE", "CH0I")
+
+    def __init__(self):
+        self.smc = MacSMC()
+        arm = platform.machine() == "arm64"
+        self.name = "macOS · " + ("Apple Silicon" if arm else "Intel")
+        self.model = run("sysctl", "-n", "hw.model").stdout.strip() or "?"
+
+    def battery(self) -> dict:
+        out = run("ioreg", "-rn", "AppleSmartBattery", "-a").stdout
+        if not out.strip():
+            die("no battery found (AppleSmartBattery)")
+        d = plistlib.loads(out.encode())[0]
+
+        def s64(v):
+            return v - (1 << 64) if isinstance(v, int) and v >= (1 << 63) else v
+
+        cur_cap, max_cap = d.get("CurrentCapacity"), d.get("MaxCapacity")
+        pct = cur_cap if max_cap == 100 else (round(cur_cap / max_cap * 100) if cur_cap and max_cap else None)
+        raw_max = d.get("AppleRawMaxCapacity") or (max_cap if max_cap and max_cap > 100 else None)
+        design = d.get("DesignCapacity")
+        mv, ma = d.get("Voltage"), s64(d.get("InstantAmperage", d.get("Amperage")))
+        if d.get("FullyCharged"):
+            state = "full"
+        elif d.get("IsCharging"):
+            state = "charging"
+        elif d.get("ExternalConnected"):
+            state = "not charging"
+        else:
+            state = "discharging"
+        if ma is not None and ma < -5:
+            state = "discharging"
+        tte, ttf = d.get("AvgTimeToEmpty"), d.get("AvgTimeToFull")
+        return {
+            "percent": pct, "state": state, "ac": bool(d.get("ExternalConnected")),
+            "voltage": mv / 1000 if mv else None, "current": ma / 1000 if ma is not None else None,
+            "power": (mv * ma / 1e6) if (mv and ma is not None) else None,
+            "temp_c": d.get("Temperature") / 100 if d.get("Temperature") else None,
+            "cycles": d.get("CycleCount"), "full_mah": raw_max, "design_mah": design,
+            "health": round(raw_max / design * 100, 1) if raw_max and design else None,
+            "time_to_empty": tte if tte and tte < 65535 and state == "discharging" else None,
+            "time_to_full": ttf if ttf and ttf < 65535 and state == "charging" else None,
+            "adapter_w": (d.get("AdapterDetails") or {}).get("Watts"),
+        }
+
+
+def detect() -> Platform:
+    if IS_LINUX:
+        if not LinuxSMC.available():
+            die("applesmc not found - this Linux machine does not look like an Intel Mac "
+                "(try: sudo modprobe applesmc)")
+        return LinuxPlatform()
+    if IS_MAC:
+        return MacPlatform()
+    die(f"unsupported platform: {sys.platform}")
+
+
+# --------------------------------------------------------------------------- control loop
+def plan(conf, bat, st, caps) -> list:
+    """Return the SMC writes needed for the current battery state."""
+    pct, limit = bat["percent"], conf["limit"]
+    if pct is None:
+        return []
+    floor = pct <= SAFETY_FLOOR
+    writes = []
+    if caps["hw_limit"] and st["hw_limit"] != limit:
+        writes += Platform.w_hw_limit(limit)
+    if caps["inhibit"] and not caps["hw_limit"]:
+        blocked = bool(st["charging_blocked"])
+        if floor or limit >= 100:
+            want = False
+        elif pct >= limit:
+            want = True
+        elif pct <= limit - conf["hysteresis"]:
+            want = False
+        else:
+            want = blocked                       # inside the hysteresis band: keep as is
+        if want != blocked:
+            writes += Platform.w_charging(caps, enabled=not want)
+    if caps["discharge"]:
+        off = bool(st["adapter_off"])
+        if floor or limit >= 100 or not conf["auto_discharge"]:
+            want_off = False
+        elif off:
+            want_off = pct > limit                # keep discharging down to the limit
+        else:
+            want_off = bool(bat["ac"]) and pct > limit
+        if want_off != off:
+            writes += Platform.w_adapter(caps, enabled=not want_off)
+    return writes
+
+
+def describe(writes, caps) -> str:
+    parts = []
+    for k, v in writes:
+        if k == "BCLM":
+            parts.append(f"hardware limit -> {v[0]}%")
+        elif k in ("CHTE", "CH0B"):
+            parts.append("charging " + ("paused" if any(v) else "resumed"))
+        elif k == caps["discharge"]:
+            on = (v[0] == 0) if k == "ACEN" else bool(v[0])
+            parts.append("adapter bypassed (discharging)" if on else "adapter restored")
+    return ", ".join(parts)
+
+
+def restore_writes(plat, caps) -> list:
+    st = plat.control_state(caps)
+    w = []
+    if caps["inhibit"] and st["charging_blocked"]:
+        w += Platform.w_charging(caps, True)
+    if caps["discharge"] and st["adapter_off"]:
+        w += Platform.w_adapter(caps, True)
+    return w
+
+
+def write_state(plat, caps, conf, bat, st):
+    data = {"time": int(time.time()), "version": VERSION, "conf": conf, "caps": caps, "control": st,
+            "battery": bat}
+    try:
+        tmp = STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, STATE_PATH)
+    except OSError:
+        pass
+
+
+def cmd_daemon(_args):
+    need_root("daemon")
+    plat = detect()
+    caps = plat.caps()
+    log(f"macbat {VERSION} daemon on {plat.model} [{plat.name}] caps={caps}")
+    if not any(caps.values()):
+        die("no supported SMC charge-control keys on this machine")
+    stop = {"flag": False}
+    force = {"flag": True}
+
+    def on_signal(signum, _frame):
+        stop["flag"] = True
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGHUP, lambda *_: force.update(flag=True))
+
+    def do_restore(reason):
+        w = restore_writes(plat, caps)
+        if w:
+            plat.write(w)
+            log(f"{reason}: {describe(w, caps)}")
+
+    watcher = None
+    if IS_MAC:
+        try:
+            watcher = MacSleepWatcher(on_sleep=lambda: do_restore("going to sleep"),
+                                      on_wake=lambda: force.update(flag=True))
+        except Exception as e:
+            log(f"warning: sleep notifications unavailable ({e}); auto-discharge will be disabled")
+    conf_mtime, next_tick = None, 0.0
+    while not stop["flag"]:
+        mtime = os.path.getmtime(CONF_PATH) if os.path.exists(CONF_PATH) else None
+        if force["flag"] or mtime != conf_mtime or time.monotonic() >= next_tick:
+            force["flag"] = False
+            conf_mtime = mtime
+            conf = load_conf()
+            if IS_MAC and watcher is None:
+                conf["auto_discharge"] = False
+            try:
+                bat = plat.battery()
+                st = plat.control_state(caps)
+                w = plan(conf, bat, st, caps)
+                if w:
+                    plat.write(w)
+                    log(f"battery {bat['percent']}% ac={'yes' if bat['ac'] else 'no'} limit={conf['limit']}%: "
+                        f"{describe(w, caps)}")
+                    st = plat.control_state(caps)
+                write_state(plat, caps, conf, bat, st)
+            except Exception as e:
+                log(f"error: {e}")
+            next_tick = time.monotonic() + conf["interval"]
+        if watcher:
+            watcher.run(2.0)
+        else:
+            time.sleep(2.0)
+    do_restore("stopping")
+    log("stopped")
+
+
+# --------------------------------------------------------------------------- status
+def service_state() -> str:
+    if IS_LINUX:
+        r = run("systemctl", "is-active", "macbat")
+        return r.stdout.strip() or "unknown"
+    if IS_MAC:
+        r = run("launchctl", "print", f"system/{LAUNCHD_LABEL}")
+        if r.returncode != 0:
+            return "not installed" if not os.path.exists(LAUNCHD_PLIST) else "stopped"
+        return "active" if "state = running" in r.stdout else "loaded"
+    return "unknown"
+
+
+def fmt_min(m):
+    return "-" if m is None else f"{m // 60}h{m % 60:02d}m"
+
+
+def bar(pct, limit, width=24, utf=True):
+    full, empty, mark = ("█", "░", "│") if utf else ("#", ".", "|")
+    n = round((pct or 0) / 100 * width)
+    cells = [full if i < n else empty for i in range(width)]
+    if limit < 100:
+        cells[min(width - 1, round(limit / 100 * width))] = mark
+    return "".join(cells)
+
+
+def gather(plat):
+    """Battery + control state. Non-root on Linux falls back to the daemon's state file."""
+    conf = load_conf()
+    bat = plat.battery()
+    caps = st = None
+    source = "live"
+    try:
+        caps = plat.caps()
+        st = plat.control_state(caps)
+    except (PermissionError, OSError):
+        try:
+            with open(STATE_PATH) as f:
+                s = json.load(f)
+            caps, st = s["caps"], s["control"]
+            source = f"daemon, {int(time.time() - s['time'])}s ago"
+        except (OSError, ValueError, KeyError):
+            source = "unavailable (run with sudo, or install the service)"
+    return conf, bat, caps, st, source
+
+
+def mode_text(conf, bat, caps, st):
+    if st and st.get("adapter_off"):
+        return f"discharging to {conf['limit']}% (adapter bypassed)"
+    if st and st.get("charging_blocked"):
+        return f"holding at limit (charging paused)"
+    s = bat["state"]
+    if bat["ac"] and caps and caps.get("hw_limit") and st and st.get("hw_limit") and bat["percent"] is not None \
+            and bat["percent"] >= st["hw_limit"] and s != "charging":
+        return "holding at limit (hardware)"
+    return {"charging": "charging", "discharging": "on battery" if not bat["ac"] else "discharging",
+            "full": "full", "not charging": "not charging"}.get(s, s)
+
+
+def cmd_status(args):
+    plat = detect()
+    conf, bat, caps, st, source = gather(plat)
+    if args.json:
+        print(json.dumps({"version": VERSION, "platform": plat.name, "model": plat.model, "conf": conf,
+                          "battery": bat, "caps": caps, "control": st, "control_source": source,
+                          "service": service_state()}, indent=2))
+        return
+    utf = (sys.stdout.encoding or "").lower().startswith("utf")
+    dot = "·" if utf else "-"
+    pct = bat["percent"]
+    lim = conf["limit"]
+    print(f"macbat {VERSION}  {dot}  {plat.model}  {dot}  {plat.name}")
+    print(f"  Battery   {pct if pct is not None else '?'}%  [{bar(pct, lim, utf=utf)}]  {mode_text(conf, bat, caps, st)}")
+    if st and st.get("adapter_off"):
+        pw = ["AC adapter bypassed by macbat (running on battery)"]
+    else:
+        pw = [("AC connected" if bat["ac"] else "on battery")]
+    if bat.get("adapter_w"):
+        pw.append(f"{bat['adapter_w']} W adapter")
+    print(f"  Power     {f' {dot} '.join(pw)}")
+    if caps:
+        how = ("hardware (BCLM)" if caps["hw_limit"] else
+               f"software ({caps['inhibit']})" if caps["inhibit"] else "not supported")
+        dis = (f"{'on' if conf['auto_discharge'] else 'off'} ({caps['discharge']})" if caps["discharge"]
+               else "not supported")
+        cur = f", SMC now {st['hw_limit']}%" if st and st.get("hw_limit") not in (None, lim) else ""
+        print(f"  Limit     {lim}%  {dot}  {how}{cur}  {dot}  auto-discharge: {dis}")
+    else:
+        print(f"  Limit     {lim}%  {dot}  control state: {source}")
+    h = []
+    if bat.get("health") is not None:
+        cap = f" ({bat['full_mah']}/{bat['design_mah']} mAh)" if bat.get("full_mah") and bat.get("design_mah") else ""
+        h.append(f"{bat['health']}%{cap}")
+    if bat.get("cycles") is not None:
+        h.append(f"{bat['cycles']} cycles")
+    print(f"  Health    {f' {dot} '.join(h) or '?'}")
+    el = []
+    if bat.get("voltage"):
+        el.append(f"{bat['voltage']:.2f} V")
+    if bat.get("current") is not None:
+        el.append(f"{bat['current']:+.2f} A")
+    if bat.get("power") is not None:
+        el.append(f"{bat['power']:+.1f} W")
+    if bat.get("temp_c") is not None:
+        el.append(f"{bat['temp_c']:.1f} °C" if utf else f"{bat['temp_c']:.1f} C")
+    print(f"  Electric  {f' {dot} '.join(el) or '?'}")
+    if bat.get("time_to_empty") or bat.get("time_to_full"):
+        print(f"  Time      to empty {fmt_min(bat.get('time_to_empty'))}  {dot}  to full {fmt_min(bat.get('time_to_full'))}")
+    print(f"  Service   {service_state()}" + (f"  {dot}  control: {source}" if source != "live" else ""))
+
+
+# --------------------------------------------------------------------------- settings commands
+def apply_now(plat, conf):
+    """Apply what can safely be applied without the daemon (hardware limit only)."""
+    caps = plat.caps()
+    st = plat.control_state(caps)
+    if caps["hw_limit"] and st["hw_limit"] != conf["limit"]:
+        plat.write(Platform.w_hw_limit(conf["limit"]))
+        print(f"hardware charge limit set to {conf['limit']}%")
+    if service_state() != "active":
+        if caps["inhibit"] or caps["discharge"]:
+            print("note: the macbat service is not running - software limit / auto-discharge need it "
+                  "(sudo macbat install)")
+    else:
+        print("the macbat service will apply the change within a few seconds")
+
+
+def cmd_limit(args):
+    conf = load_conf()
+    if args.value is None:
+        print(f"{conf['limit']}%")
+        return
+    need_root("limit")
+    v = args.value.lower()
+    pct = 100 if v in ("off", "100") else int(v.rstrip("%"))
+    if not 20 <= pct <= 100:
+        die("limit must be between 20 and 100 (or 'off')")
+    conf["limit"] = pct
+    save_conf(conf)
+    print(f"limit: {pct}%" + (" (off)" if pct == 100 else ""))
+    apply_now(detect(), conf)
+
+
+def cmd_discharge(args):
+    conf = load_conf()
+    if args.value is None:
+        print("on" if conf["auto_discharge"] else "off")
+        return
+    need_root("discharge")
+    conf["auto_discharge"] = args.value == "on"
+    save_conf(conf)
+    print(f"auto-discharge above the limit: {args.value}")
+    apply_now(detect(), conf)
+
+
+def cmd_restore(args):
+    need_root("restore")
+    plat = detect()
+    caps = plat.caps()
+    w = restore_writes(plat, caps)
+    plat.write(w)
+    if not args.quiet:
+        print(describe(w, caps) or "nothing to restore (charging and adapter already normal)")
+
+
+def cmd_keys(_args):
+    plat = detect()
+    keys = ["BCLM", "CHTE", "CH0B", "CH0C", "CHIE", "CH0I", "ACEN", "ACLC", "B0AV", "B0FC", "B0CT",
+            "TB0T", "BFCL"]
+    for k in keys:
+        try:
+            r = plat.smc.read(k)
+        except (PermissionError, OSError) as e:
+            die(f"cannot read SMC ({e}) - try sudo")
+        if r:
+            print(f"  {k}  {r[0].strip():<5} {r[1].hex():<10} = {decode(r[0], r[1], plat.smc.little_endian)}")
+        else:
+            print(f"  {k}  -")
+
+
+# --------------------------------------------------------------------------- install / uninstall
+SYSTEMD_UNIT_BODY = f"""[Unit]
+Description=macbat - battery charge limiter for Apple laptops
+# no ordering against mbpfan on purpose: macbat stops/restarts mbpfan around SMC writes,
+# and an ordering dependency would deadlock that while macbat itself is stopping.
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I {INSTALL_BIN} daemon
+ExecStopPost=/usr/bin/python3 -I {INSTALL_BIN} restore --quiet
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+SLEEP_HOOK_BODY = f"""#!/bin/sh
+# macbat: never stay in 'adapter bypassed / charging paused' while suspended
+[ "$1" = pre ] && /usr/bin/python3 -I {INSTALL_BIN} restore --quiet
+[ "$1" = post ] && systemctl kill -s HUP macbat.service 2>/dev/null
+exit 0
+"""
+
+
+def stable_python() -> str:
+    for p in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3"):
+        if os.access(p, os.X_OK):
+            return p
+    if os.access("/usr/bin/python3", os.X_OK) and run("xcode-select", "-p").returncode == 0:
+        return "/usr/bin/python3"
+    return sys.executable
+
+
+def cmd_install(_args):
+    need_root("install")
+    plat = detect()
+    caps = plat.caps()
+    if not any(caps.values()):
+        die("this machine has no supported SMC charge-control keys")
+    os.makedirs(os.path.dirname(INSTALL_BIN), exist_ok=True)
+    me = os.path.realpath(sys.argv[0])
+    if me != os.path.realpath(INSTALL_BIN):
+        shutil.copyfile(me, INSTALL_BIN)
+    os.chmod(INSTALL_BIN, 0o755)
+    if not os.path.exists(CONF_PATH):
+        save_conf(dict(DEFAULTS))
+    if IS_LINUX:
+        with open(SYSTEMD_UNIT, "w") as f:
+            f.write(SYSTEMD_UNIT_BODY)
+        os.makedirs(os.path.dirname(SLEEP_HOOK), exist_ok=True)
+        with open(SLEEP_HOOK, "w") as f:
+            f.write(SLEEP_HOOK_BODY)
+        os.chmod(SLEEP_HOOK, 0o755)
+        run("systemctl", "daemon-reload")
+        run("systemctl", "enable", "macbat.service")
+        r = run("systemctl", "restart", "macbat.service")      # picks up a new binary on upgrade
+        if r.returncode:
+            die(r.stderr.strip())
+    else:
+        py = stable_python()
+        with open(LAUNCHD_PLIST, "wb") as f:
+            plistlib.dump({"Label": LAUNCHD_LABEL, "ProgramArguments": [py, "-I", INSTALL_BIN, "daemon"],
+                           "RunAtLoad": True, "KeepAlive": True,
+                           "StandardOutPath": "/var/log/macbat.log", "StandardErrorPath": "/var/log/macbat.log"}, f)
+        os.chmod(LAUNCHD_PLIST, 0o644)
+        run("launchctl", "bootout", f"system/{LAUNCHD_LABEL}")
+        r = run("launchctl", "bootstrap", "system", LAUNCHD_PLIST)
+        if r.returncode:
+            die(f"launchctl bootstrap failed: {r.stderr.strip()}")
+    c = load_conf()
+    print(f"installed {INSTALL_BIN} and started the service (limit {c['limit']}%, "
+          f"auto-discharge {'on' if c['auto_discharge'] else 'off'}).  caps: {caps}")
+
+
+def cmd_uninstall(_args):
+    need_root("uninstall")
+    if IS_LINUX:
+        run("systemctl", "disable", "--now", "macbat.service")
+        for p in (SYSTEMD_UNIT, SLEEP_HOOK):
+            if os.path.exists(p):
+                os.remove(p)
+        run("systemctl", "daemon-reload")
+    else:
+        run("launchctl", "bootout", f"system/{LAUNCHD_LABEL}")
+        if os.path.exists(LAUNCHD_PLIST):
+            os.remove(LAUNCHD_PLIST)
+    plat = detect()
+    caps = plat.caps()
+    w = restore_writes(plat, caps)
+    if caps["hw_limit"]:
+        w += Platform.w_hw_limit(100)
+    plat.write(w)
+    for p in (STATE_PATH,):
+        if os.path.exists(p):
+            os.remove(p)
+    print("service removed; charging restored to normal (limit 100%). "
+          f"{INSTALL_BIN} and {CONF_PATH} were left in place.")
+
+
+# --------------------------------------------------------------------------- main
+def main():
+    ap = argparse.ArgumentParser(
+        prog="macbat",
+        description="Battery charge limiter & status for Apple laptops (Intel Macs on Linux, Apple Silicon/Intel macOS).",
+        epilog="examples:  macbat   |   sudo macbat limit 80   |   sudo macbat discharge on   |   sudo macbat install")
+    ap.add_argument("--version", action="version", version=f"macbat {VERSION}")
+    sub = ap.add_subparsers(dest="cmd")
+    p = sub.add_parser("status", help="show battery and charge-limit status (default)")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("limit", help="show or set the charge limit: 20-100 or 'off'")
+    p.add_argument("value", nargs="?")
+    p = sub.add_parser("discharge", help="auto-discharge (bypass the adapter) when above the limit")
+    p.add_argument("value", nargs="?", choices=["on", "off"])
+    sub.add_parser("install", help="install the background service (systemd / launchd)")
+    sub.add_parser("uninstall", help="remove the service and restore normal charging")
+    p = sub.add_parser("restore", help="immediately resume charging and re-enable the adapter")
+    p.add_argument("--quiet", action="store_true")
+    sub.add_parser("keys", help="show the relevant SMC keys (diagnostics)")
+    sub.add_parser("daemon", help=argparse.SUPPRESS)
+    args = ap.parse_args()
+    if args.cmd in (None, "status"):
+        if args.cmd is None:
+            args.json = False
+        return cmd_status(args)
+    return {"limit": cmd_limit, "discharge": cmd_discharge, "install": cmd_install, "uninstall": cmd_uninstall,
+            "restore": cmd_restore, "keys": cmd_keys, "daemon": cmd_daemon}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
