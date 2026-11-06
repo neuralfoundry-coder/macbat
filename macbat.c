@@ -9,7 +9,7 @@
  * Single file, no dependencies.  Build:  make   (see Makefile)
  * SPDX-License-Identifier: MIT
  */
-#define MACBAT_VERSION "0.4.0"
+#define MACBAT_VERSION "0.5.0"
 
 #include <ctype.h>
 #include <errno.h>
@@ -224,6 +224,7 @@ typedef struct {
     char fan[16];          /* "auto", "<rpm>" or "<n>%" of the fan's min..max range */
     char fan_paused[32];   /* fan daemon (mbpfan) that macbat stopped for a manual speed */
     bool fan_paused_enabled;
+    char theme[16];        /* look of the status / settings screens; empty = default (modern) */
 } conf_t;
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
@@ -252,7 +253,7 @@ static conf_t load_conf(void) {
             else if (!strcmp(k, "interval")) c.interval = atoi(v);
 #define CS(name) else if (!strcmp(k, #name)) snprintf(c.name, sizeof c.name, "%s", v)
             CS(sata_alpm); CS(wifi_ps); CS(usb_as); CS(cpu_gov); CS(cpu_turbo); CS(aspm); CS(spindown);
-            CS(fan); CS(fan_paused);
+            CS(fan); CS(fan_paused); CS(theme);
 #undef CS
             else if (!strcmp(k, "fan_paused_enabled")) c.fan_paused_enabled = !strcasecmp(v, "on");
             else if (!strcmp(k, "screen_blank")) c.screen_blank = *v ? atoi(v) : -1;
@@ -280,6 +281,7 @@ static void save_conf(conf_t c) {
 #undef CS
     snprintf(t, sizeof t, "fan=%s\n", c.fan);
     strcat(b, t);
+    if (*c.theme) { snprintf(t, sizeof t, "theme=%s\n", c.theme); strcat(b, t); }
     if (*c.fan_paused) {
         snprintf(t, sizeof t, "fan_paused=%s\nfan_paused_enabled=%s\n", c.fan_paused, c.fan_paused_enabled ? "on" : "off");
         strcat(b, t);
@@ -1412,23 +1414,162 @@ static void json_str(const char *k, const char *v, bool comma) {
 }
 
 
-/* ------------------------------------------------------------------ retro status screen */
-/* Only glyphs present in the Linux console Terminus fonts are used (box drawing, █ ▒ ░, ▲ ▼ ● ▸ ·). */
+/* ------------------------------------------------------------------ themes */
+/* Glyphs: only what the Linux console Terminus font has (box drawing incl. ╭ ━ ┃ ┈, █ ░, ▲ ▼ ● ○ ◆ ■ · › ‹ « » ↑).
+ * Colours degrade: truecolor (COLORTERM=truecolor) -> 256 (TERM=*256*) -> 16 (TERM=linux, anything else) -> none. */
 #define RW 62 /* inner width of the frame */
 
-typedef struct { const char *frame, *title, *label, *value, *dim, *hi, *warn, *ok, *bad, *reset; } theme_t;
+typedef struct { const char *attr; int rgb; const char *c16; } ink_t; /* rgb -1: use c16 (NULL = default colour) */
+enum { ST_RETRO, ST_ROUND, ST_SQUARE };
+typedef struct {
+    const char *name, *desc;
+    int style;
+    const char *fill, *empty, *mark; /* slim bar glyphs (not retro) */
+    int grad;                        /* truecolor bar gradient: hi colour -> grad, -1 = none */
+    ink_t frame, title, label, value, dim, hi, warn, ok, bad;
+} theme_def_t;
 
-static theme_t theme(void) {
-    if (getenv("NO_COLOR")) return (theme_t){"", "", "", "", "", "", "", "", "", ""};
-    const char *th = getenv("MACBAT_THEME");
-    if (th && !strcasecmp(th, "amber"))
-        return (theme_t){"\033[33m", "\033[1;93m", "\033[33m", "\033[93m", "\033[2;33m", "\033[1;97m", "\033[1;91m",
-                         "\033[1;93m", "\033[1;91m", "\033[0m"};
-    return (theme_t){"\033[32m", "\033[1;92m", "\033[32m", "\033[92m", "\033[2;32m", "\033[1;93m", "\033[1;91m",
-                     "\033[1;92m", "\033[1;91m", "\033[0m"};
+#define NONE {"", -1, NULL}
+static const theme_def_t THEMES[] = {
+    {"modern", "clean, rounded, one blue accent - reads on dark and light terminals", ST_ROUND, "━", "─", "┃", -1,
+     {"", 0x6e7681, "90"}, {"", 0x3b8eea, "36"}, {"", 0x7d8590, "90"}, NONE, {"", 0x6e7681, "90"}, {"", 0x3b8eea, "36"},
+     {"", 0xd29922, "33"}, {"", 0x2da44e, "32"}, {"", 0xe5534b, "91"}},
+    {"mono", "no colour at all - any terminal, same as NO_COLOR", ST_SQUARE, "━", "┈", "┃", -1,
+     NONE, {"1", -1, NULL}, {"2", -1, NULL}, NONE, {"2", -1, NULL}, {"1", -1, NULL}, {"1", -1, NULL}, NONE, {"1", -1, NULL}},
+    {"ocean", "deep blue frame, aqua accents, gradient gauge", ST_ROUND, "━", "─", "┃", 0x4fd6f7,
+     {"", 0x2f6fd8, "94"}, {"", 0x4fd6f7, "96"}, {"", 0x5aa9d6, "36"}, NONE, {"", 0x5f7f9f, "90"}, {"", 0x2f8fe8, "96"},
+     {"", 0xffb454, "93"}, {"", 0x2ec4b6, "36"}, {"", 0xff5f7e, "91"}},
+    {"candy", "pastel pink and lavender, dotted gauge", ST_ROUND, "●", "·", "◆", 0xb89cff,
+     {"", 0xc39bf5, "95"}, {"", 0xff7ac6, "95"}, {"", 0xb48ef0, "35"}, NONE, {"", 0x9a86b5, "90"}, {"", 0xff7ac6, "95"},
+     {"", 0xffc66d, "93"}, {"", 0x7ee0b5, "92"}, {"", 0xff6e8a, "91"}},
+    {"nord", "arctic blue-grey (Nord palette), square frame", ST_SQUARE, "■", "·", "┃", -1,
+     {"", 0x4c566a, "90"}, {"", 0x88c0d0, "96"}, {"", 0x81a1c1, "94"}, NONE, {"", 0x616e88, "90"}, {"", 0x88c0d0, "96"},
+     {"", 0xebcb8b, "33"}, {"", 0xa3be8c, "32"}, {"", 0xbf616a, "91"}},
+    {"retro", "green CRT: double frame, block digits (the 0.4 look)", ST_RETRO, "█", "░", "│", -1,
+     {"", -1, "32"}, {"1", -1, "92"}, {"", -1, "32"}, {"", -1, "92"}, {"2", -1, "32"}, {"1", -1, "93"},
+     {"1", -1, "91"}, {"1", -1, "92"}, {"1", -1, "91"}},
+    {"amber", "amber CRT, same layout as retro", ST_RETRO, "█", "░", "│", -1,
+     {"", -1, "33"}, {"1", -1, "93"}, {"", -1, "33"}, {"", -1, "93"}, {"2", -1, "33"}, {"1", -1, "97"},
+     {"1", -1, "91"}, {"1", -1, "93"}, {"1", -1, "91"}},
+};
+#undef NONE
+#define NTHEMES ((int)(sizeof THEMES / sizeof THEMES[0]))
+
+typedef struct {
+    char frame[40], title[40], label[40], value[40], dim[40], hi[40], warn[40], ok[40], bad[40];
+    const char *reset;
+    const theme_def_t *d;
+    bool retro;
+    int depth; /* 0 / 16 / 256 / 24 */
+    const char *tl, *tr, *bl, *br, *h, *v, *jl, *jr, *jl2, *jr2, *h2;
+} theme_t;
+
+static const theme_def_t *g_th = NULL;
+static char g_th_src[64] = "default";
+static int g_depth = -1;
+
+static const theme_def_t *find_theme(const char *n) {
+    if (!n) return NULL;
+    if (!strcasecmp(n, "green")) n = "retro"; /* MACBAT_THEME=green from 0.3/0.4 */
+    for (int i = 0; i < NTHEMES; i++) if (!strcasecmp(THEMES[i].name, n)) return &THEMES[i];
+    return NULL;
+}
+static void theme_names(char *o, size_t n) {
+    o[0] = 0;
+    for (int i = 0; i < NTHEMES; i++) { if (i) strncat(o, ", ", n - strlen(o) - 1); strncat(o, THEMES[i].name, n - strlen(o) - 1); }
+}
+static void resolve_theme(const char *flag) {
+    char names[128];
+    theme_names(names, sizeof names);
+    const theme_def_t *t = NULL;
+    const char *e = getenv("MACBAT_THEME");
+    if (flag) {
+        if (!(t = find_theme(flag))) die("unknown theme '%s' - themes: %s (preview: macbat theme --list)", flag, names);
+        snprintf(g_th_src, sizeof g_th_src, "--theme");
+    } else if (e && *e) {
+        if ((t = find_theme(e))) snprintf(g_th_src, sizeof g_th_src, "MACBAT_THEME");
+        else fprintf(stderr, "macbat: unknown theme '%s' in MACBAT_THEME - themes: %s\n", e, names);
+    }
+    if (!t) {
+        conf_t c = load_conf();
+        if (*c.theme) {
+            if ((t = find_theme(c.theme))) snprintf(g_th_src, sizeof g_th_src, "%s", CONF_PATH);
+            else fprintf(stderr, "macbat: unknown theme '%s' in %s - themes: %s\n", c.theme, CONF_PATH, names);
+        }
+    }
+    if (!t) { t = &THEMES[0]; snprintf(g_th_src, sizeof g_th_src, "default"); }
+    g_th = t;
 }
 
-static bool use_retro(void) {
+static int color_depth(void) {
+    const char *nc = getenv("NO_COLOR"), *mc = getenv("MACBAT_COLORS"), *t = getenv("TERM"), *ct = getenv("COLORTERM");
+    if (nc && *nc) return 0;
+    if (mc && *mc) {
+        if (!strcmp(mc, "none") || !strcmp(mc, "0")) return 0;
+        if (!strcmp(mc, "16")) return 16;
+        if (!strcmp(mc, "256")) return 256;
+        if (!strcasecmp(mc, "truecolor") || !strcasecmp(mc, "24bit")) return 24;
+    }
+    if (t && (!strcmp(t, "linux") || !strncmp(t, "vt", 2))) return 16; /* Linux console / fbterm: 16 colours */
+    if (ct && (strstr(ct, "truecolor") || strstr(ct, "24bit"))) return 24;
+    if (t && strstr(t, "256")) return 256;
+    return 16;
+}
+
+static int rgb256(int rgb) { /* nearest xterm-256 colour (6x6x6 cube or grey ramp) */
+    int r = rgb >> 16 & 255, g = rgb >> 8 & 255, b = rgb & 255;
+    static const int lv[6] = {0, 95, 135, 175, 215, 255};
+    int ci[3], cv[3], src[3] = {r, g, b};
+    for (int k = 0; k < 3; k++) {
+        int best = 0;
+        for (int i = 1; i < 6; i++) if (abs(lv[i] - src[k]) < abs(lv[best] - src[k])) best = i;
+        ci[k] = best;
+        cv[k] = lv[best];
+    }
+    int avg = (r + g + b) / 3, gi = clampi((avg - 8 + 5) / 10, 0, 23), gv = 8 + 10 * gi;
+    long dc = (long)(cv[0] - r) * (cv[0] - r) + (long)(cv[1] - g) * (cv[1] - g) + (long)(cv[2] - b) * (cv[2] - b);
+    long dg = (long)(gv - r) * (gv - r) + (long)(gv - g) * (gv - g) + (long)(gv - b) * (gv - b);
+    return dg < dc ? 232 + gi : 16 + 36 * ci[0] + 6 * ci[1] + ci[2];
+}
+
+static void rgb_esc(char *o, size_t n, int rgb, int depth, const char *attr) {
+    char col[32] = "";
+    if (depth == 24) snprintf(col, sizeof col, ";38;2;%d;%d;%d", rgb >> 16 & 255, rgb >> 8 & 255, rgb & 255);
+    else if (depth == 256) snprintf(col, sizeof col, ";38;5;%d", rgb256(rgb));
+    snprintf(o, n, "\033[0%s%s%sm", *attr ? ";" : "", attr, col);
+}
+
+static void ink(char *o, size_t n, const ink_t *k, int depth) {
+    if (k->rgb >= 0 && (depth == 24 || depth == 256)) { rgb_esc(o, n, k->rgb, depth, k->attr); return; }
+    char col[16] = "";
+    if (depth > 0 && k->c16) snprintf(col, sizeof col, ";%s", k->c16);
+    snprintf(o, n, "\033[0%s%s%sm", *k->attr ? ";" : "", k->attr, col);
+}
+
+static theme_t theme(void) {
+    if (!g_th) resolve_theme(NULL);
+    if (g_depth < 0) g_depth = color_depth();
+    theme_t T;
+    memset(&T, 0, sizeof T);
+    T.d = g_th;
+    T.retro = g_th->style == ST_RETRO;
+    T.depth = g_depth;
+#define INK(role) ink(T.role, sizeof T.role, &g_th->role, T.depth)
+    INK(frame); INK(title); INK(label); INK(value); INK(dim); INK(hi); INK(warn); INK(ok); INK(bad);
+#undef INK
+    T.reset = "\033[0m";
+    if (T.retro) {
+        T.tl = "╔"; T.tr = "╗"; T.bl = "╚"; T.br = "╝"; T.h = "═"; T.v = "║"; T.jl = "╠"; T.jr = "╣";
+        T.jl2 = "╟"; T.jr2 = "╢"; T.h2 = "─";
+    } else {
+        bool round = g_th->style == ST_ROUND;
+        T.tl = round ? "╭" : "┌"; T.tr = round ? "╮" : "┐"; T.bl = round ? "╰" : "└"; T.br = round ? "╯" : "┘";
+        T.h = T.h2 = "─"; T.v = "│"; T.jl = T.jl2 = "├"; T.jr = T.jr2 = "┤";
+    }
+    return T;
+}
+
+static bool use_boxed(void) {
     if (g_plain || !isatty(1) || !utf8_out()) return false;
     const char *t = getenv("TERM");
     if (t && !strcmp(t, "dumb")) return false;
@@ -1460,39 +1601,115 @@ static void vis_trunc(char *s, int maxw) {
     }
 }
 
-static void upcase(char *s) { for (; *s; s++) *s = (char)toupper((unsigned char)*s); }
+/* ASCII only: with a UTF-8 locale macOS' toupper()/tolower() treat UTF-8 bytes as Latin-1 letters */
+static bool a_alnum(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); }
+static char a_up(char c) { return c >= 'a' && c <= 'z' ? (char)(c - 32) : c; }
+static char a_low(char c) { return c >= 'A' && c <= 'Z' ? (char)(c + 32) : c; }
+static void upcase(char *s) { for (; *s; s++) *s = a_up(*s); }
 
 static void r_rule(const theme_t *T, const char *l, const char *fill, const char *r) {
     printf("%s%s", T->frame, l);
     for (int i = 0; i < RW; i++) fputs(fill, stdout);
     printf("%s%s\n", r, T->reset);
 }
+static void r_top(const theme_t *T) { r_rule(T, T->tl, T->h, T->tr); }
+static void r_sep(const theme_t *T) { r_rule(T, T->jl, T->h, T->jr); }
+static void r_sep2(const theme_t *T) { r_rule(T, T->jl2, T->h2, T->jr2); }
+static void r_bot(const theme_t *T) { r_rule(T, T->bl, T->h, T->br); }
 
 static void r_line(const theme_t *T, const char *content) {
-    char buf[1024];
+    char buf[4096];
     snprintf(buf, sizeof buf, "%s", content);
     vis_trunc(buf, RW - 2);
     int w = vis_width(buf);
-    printf("%s║%s %s", T->frame, T->reset, buf);
+    printf("%s%s%s %s", T->frame, T->v, T->reset, buf);
     for (int i = w; i < RW - 1; i++) putchar(' ');
-    printf("%s║%s\n", T->frame, T->reset);
+    printf("%s%s%s\n", T->frame, T->v, T->reset);
 }
 
 static void r_split(const theme_t *T, const char *left, const char *right) {
-    char buf[1024];
+    char buf[4096];
     int pad = RW - 2 - vis_width(left) - vis_width(right);
     snprintf(buf, sizeof buf, "%s%*s%s", left, pad > 1 ? pad : 1, "", right);
     r_line(T, buf);
 }
 
+/* top rule with a caption: ╭─ caption ───────╮ */
+static void r_top_title(const theme_t *T, const char *caption) {
+    printf("%s%s%s %s%s%s ", T->frame, T->tl, T->h, T->title, caption, T->frame);
+    for (int i = vis_width(caption) + 3; i < RW; i++) fputs(T->h, stdout);
+    printf("%s%s\n", T->tr, T->reset);
+}
+
+/* "LABEL ···· value" (retro) or "Label      value" (other themes) */
 static void r_field(const theme_t *T, const char *label, const char *value) {
-    char buf[1024], lead[64];
-    int n = 9 - (int)strlen(label);
-    lead[0] = 0;
-    for (int i = 0; i < n && i < 20; i++) strcat(lead, "·");
-    snprintf(buf, sizeof buf, " %s%s %s%s%s %s%s", T->label, label, T->dim, lead, T->reset, value, T->reset);
+    char buf[4096], lead[64];
+    if (T->retro) {
+        int n = 9 - (int)strlen(label);
+        lead[0] = 0;
+        for (int i = 0; i < n && i < 20; i++) strcat(lead, "·");
+        snprintf(buf, sizeof buf, " %s%s %s%s%s %s%s", T->label, label, T->dim, lead, T->reset, value, T->reset);
+    } else snprintf(buf, sizeof buf, " %s%-10s%s%s%s", T->label, label, T->value, value, T->reset);
     r_line(T, buf);
 }
+
+/* slim gauge for the non-retro themes: w cells, frac filled, marker cell (or -1);
+ * colour: lvl, or the theme's gradient on truecolor terminals when gradient is allowed */
+static void m_bar(const theme_t *T, double frac, int mark, int w, const char *lvl, bool gradient, char *o, size_t on) {
+    int fill = clampi((int)iround(frac * w), 0, w);
+    bool grad = gradient && T->depth == 24 && T->d->grad >= 0 && T->d->hi.rgb >= 0;
+    o[0] = 0;
+    for (int i = 0; i < w; i++) {
+        char col[48];
+        const char *g;
+        if (i == mark) { snprintf(col, sizeof col, "%s", T->value); g = T->d->mark; }
+        else if (i < fill) {
+            if (grad) {
+                int a = T->d->hi.rgb, b = T->d->grad;
+                double f = w > 1 ? (double)i / (w - 1) : 0;
+                int r = (int)iround((a >> 16 & 255) + ((b >> 16 & 255) - (a >> 16 & 255)) * f);
+                int gg = (int)iround((a >> 8 & 255) + ((b >> 8 & 255) - (a >> 8 & 255)) * f);
+                int bb = (int)iround((a & 255) + ((b & 255) - (a & 255)) * f);
+                rgb_esc(col, sizeof col, r << 16 | gg << 8 | bb, 24, "");
+            } else snprintf(col, sizeof col, "%s", lvl);
+            g = T->d->fill;
+        } else { snprintf(col, sizeof col, "%s", T->dim); g = T->d->empty; }
+        strncat(o, col, on - strlen(o) - 1);
+        strncat(o, g, on - strlen(o) - 1);
+    }
+    strncat(o, T->reset, on - strlen(o) - 1);
+}
+
+/* "↑ limit 80%" under the marker of a gauge that starts after `indent` columns */
+static void m_caption(const theme_t *T, int indent, int mark, const char *text, const char *right) {
+    char l[512], t[160];
+    snprintf(t, sizeof t, "↑ %s", text);
+    int tw = vis_width(t), pos = indent + mark;
+    if (pos + tw > RW - 2) { snprintf(t, sizeof t, "%s ↑", text); pos = indent + mark - tw + 1; }
+    if (mark < 0) { t[0] = 0; pos = 0; }
+    snprintf(l, sizeof l, "%*s%s%s%s", pos > 0 ? pos : 0, "", T->dim, t, T->reset);
+    if (right) {
+        int pad = RW - 2 - vis_width(l) - vis_width(right);
+        if (pad >= 2) { size_t k = strlen(l); snprintf(l + k, sizeof l - k, "%*s%s%s%s", pad, "", T->dim, right, T->reset); }
+    }
+    r_line(T, l);
+}
+
+/* "MEDIUM + DIPM" -> "medium + DIPM": calmer value text for the non-retro themes */
+static void soft_case(char *s) {
+    static const char *keep[] = {"DIPM", "ALPM", "SMC", "AC", "CPU", "USB", "PCIE", "BCLM", "ACEN", "CHTE", "CHIE", "SATA"};
+    for (char *p = s; *p;) {
+        if (!a_alnum(*p)) { p++; continue; }
+        char *e = p;
+        while (a_alnum(*e)) e++;
+        bool k = false;
+        for (size_t i = 0; i < sizeof keep / sizeof keep[0]; i++)
+            if ((size_t)(e - p) == strlen(keep[i]) && !strncasecmp(p, keep[i], (size_t)(e - p))) k = true;
+        for (char *q = p; q < e; q++) *q = k ? a_up(*q) : a_low(*q);
+        p = e;
+    }
+}
+static void title_case(char *s) { soft_case(s); if (*s) *s = a_up(*s); }
 
 /* 3x5 block digits */
 static const char *BIG[12][5] = {
@@ -1514,14 +1731,14 @@ static void big_row(const char *txt, int row, char *out, size_t on) {
 static void status_retro(const conf_t *c, const battery_t *b, const caps_t *cp, const control_t *s, bool have,
                          const char *source, const char *model, const char *conf_app, const char *mode) {
     theme_t T = theme();
-    char l[512], r[256], v[512];
+    char l[4096], r[256], v[1024];
     const int GW = 26;
     int pct = b->percent < 0 ? 0 : b->percent > 100 ? 100 : b->percent;
     int fill = (int)iround(pct / 100.0 * GW), mark = c->limit < 100 ? (int)iround(c->limit / 100.0 * GW) : -1;
     if (mark >= GW) mark = GW - 1;
     const char *lvl = pct >= 50 ? T.ok : pct >= 20 ? T.hi : T.bad;
 
-    r_rule(&T, "╔", "═", "╗");
+    r_top(&T);
     snprintf(l, sizeof l, "%s█▒░ M A C B A T ░▒█%s", T.title, T.reset);
     snprintf(r, sizeof r, "%sv%s · %s%s", T.dim, MACBAT_VERSION, model, T.reset);
     r_split(&T, l, r);
@@ -1533,13 +1750,13 @@ static void status_retro(const conf_t *c, const battery_t *b, const caps_t *cp, 
     snprintf(l, sizeof l, "%s%s%s", T.label, pn, T.reset);
     snprintf(r, sizeof r, "%s%s%s", T.dim, ts, T.reset);
     r_split(&T, l, r);
-    r_rule(&T, "╠", "═", "╣");
+    r_sep(&T);
 
     /* battery gauge (3 rows) next to 5-row block digits */
     char pcts[16];
     if (b->percent >= 0) snprintf(pcts, sizeof pcts, "%d", b->percent); else snprintf(pcts, sizeof pcts, "?");
     for (int row = 0; row < 5; row++) {
-        char g[1024] = "", dg[256];
+        char g[2048] = "", dg[256];
         if (row >= 1 && row <= 3) {
             strcat(g, T.frame);
             strcat(g, row == 1 ? "┌" : row == 2 ? "│" : "└");
@@ -1572,7 +1789,7 @@ static void status_retro(const conf_t *c, const battery_t *b, const caps_t *cp, 
         snprintf(l, sizeof l, "%s%s▲ LIMIT %d%%%s", tick, T.dim, c->limit, T.reset);
         r_line(&T, l);
     }
-    r_rule(&T, "╟", "─", "╢");
+    r_sep2(&T);
 
     /* fields */
     if (have && s->adapter_off == 1) snprintf(v, sizeof v, "%sAC BYPASSED · RUNNING ON BATTERY", T.hi);
@@ -1652,7 +1869,113 @@ static void status_retro(const conf_t *c, const battery_t *b, const caps_t *cp, 
         snprintf(l, sizeof l, " %s!! %s MANAGES CHARGING - MACBAT STAYS HANDS-OFF%s", T.warn, cu, T.reset);
         r_line(&T, l);
     }
-    r_rule(&T, "╚", "═", "╝");
+    r_bot(&T);
+}
+
+/* ------------------------------------------------------------------ status page, non-retro themes */
+static void hdr_modern(const theme_t *T, const char *what, const char *model) {
+    char l[512], r[256], ts[16];
+    r_top(T);
+    snprintf(l, sizeof l, "%smacbat%s %s%s%s", T->title, T->reset, T->dim, what, T->reset);
+    snprintf(r, sizeof r, "%sv%s · %s%s", T->dim, MACBAT_VERSION, model, T->reset);
+    r_split(T, l, r);
+    time_t now = time(NULL);
+    strftime(ts, sizeof ts, "%H:%M:%S", localtime(&now));
+    snprintf(l, sizeof l, "%s%s%s", T->dim, platform_name(), T->reset);
+    snprintf(r, sizeof r, "%s%s%s", T->dim, ts, T->reset);
+    r_split(T, l, r);
+    r_sep(T);
+}
+
+static const char *lvl_ink(const theme_t *T, int pct) {
+    if (T->retro) return pct >= 50 ? T->ok : pct >= 20 ? T->hi : T->bad;
+    return pct >= 50 ? T->ok : pct >= 20 ? T->warn : T->bad;
+}
+
+static void status_modern(const conf_t *c, const battery_t *b, const caps_t *cp, const control_t *s, bool have,
+                          const char *source, const char *model, const char *conf_app, const char *mode) {
+    theme_t T = theme();
+    char l[4096], v[1024], t[160];
+    const int BW = RW - 4;
+    int pct = b->percent < 0 ? 0 : b->percent > 100 ? 100 : b->percent;
+    int mark = c->limit < 100 ? clampi((int)iround(c->limit / 100.0 * BW), 0, BW - 1) : -1;
+    const char *lvl = lvl_ink(&T, pct);
+    hdr_modern(&T, "battery", model);
+    r_line(&T, "");
+    char md[128];
+    snprintf(md, sizeof md, "%s", mode);
+    if (*md) md[0] = a_up(md[0]);
+    const char *arrow = !strcmp(b->state, "charging") ? " ▲" : (!strcmp(b->state, "discharging") ? " ▼" : "");
+    if (have && s->adapter_off == 1) arrow = " ▼";
+    if (b->percent >= 0) snprintf(t, sizeof t, "%d%%", b->percent); else snprintf(t, sizeof t, "?%%");
+    snprintf(l, sizeof l, " %s%s%s   %s%s%s%s", lvl, t, T.reset, T.hi, md, arrow, T.reset);
+    r_line(&T, l);
+    char bar[3072];
+    m_bar(&T, pct / 100.0, mark, BW, lvl, pct >= 20, bar, sizeof bar);
+    snprintf(l, sizeof l, " %s", bar);
+    r_line(&T, l);
+    snprintf(t, sizeof t, "limit %d%%", c->limit);
+    m_caption(&T, 1, mark, t, NULL);
+    r_sep(&T);
+
+    if (have && s->adapter_off == 1) snprintf(v, sizeof v, "%sAC bypassed · running on battery", T.hi);
+    else {
+        snprintf(v, sizeof v, "%s", b->ac == 1 ? "AC connected" : "on battery");
+        if (b->adapter_w > 0) { snprintf(t, sizeof t, " · %d W adapter", b->adapter_w); strcat(v, t); }
+    }
+    r_field(&T, "Power", v);
+    if (have) {
+        char how[48];
+        if (cp->hw_limit) snprintf(how, sizeof how, "hardware (BCLM)");
+        else if (cp->inhibit) snprintf(how, sizeof how, "software (%s)", cp->inhibit);
+        else snprintf(how, sizeof how, "not supported");
+        snprintf(v, sizeof v, "%d%% · %s", c->limit, how);
+        if (cp->discharge) { snprintf(t, sizeof t, " · auto-discharge %s", c->auto_discharge ? "on" : "off"); strcat(v, t); }
+    } else snprintf(v, sizeof v, "%d%% %s· control state needs sudo or the service", c->limit, T.dim);
+    r_field(&T, "Limit", v);
+    if (b->health_unreliable)
+        snprintf(v, sizeof v, "%sn/a %s(uncalibrated: %d > %d mAh)%s", T.hi, T.dim, b->full_mah, b->design_mah, T.value);
+    else if (b->health >= 0) {
+        snprintf(v, sizeof v, "%.1f%%", b->health);
+        if (b->full_mah > 0 && b->design_mah > 0) { snprintf(t, sizeof t, " %s(%d/%d mAh)%s", T.dim, b->full_mah, b->design_mah, T.value); strcat(v, t); }
+    } else snprintf(v, sizeof v, "?");
+    if (b->cycles >= 0) { snprintf(t, sizeof t, " · %d cycles", b->cycles); strcat(v, t); }
+    r_field(&T, "Health", v);
+    if (*b->maker || *b->model) { snprintf(v, sizeof v, "%s %s", b->maker, b->model); r_field(&T, "Pack", v); }
+    v[0] = 0;
+    bool first = true;
+#define ADD(...) do { snprintf(t, sizeof t, __VA_ARGS__); if (!first) strcat(v, " · "); strcat(v, t); first = false; } while (0)
+    if (b->has_v) ADD("%.2f V", b->voltage);
+    if (b->has_i) ADD("%+.2f A", b->current);
+    if (b->has_p) ADD("%+.1f W", b->power);
+    if (b->has_t) ADD("%.1f °C", b->temp_c);
+#undef ADD
+    r_field(&T, "Cell", first ? "?" : v);
+    if (b->tte >= 0 || b->ttf >= 0) {
+        char m[16];
+        fmt_min(b->tte >= 0 ? b->tte : b->ttf, m, sizeof m);
+        snprintf(v, sizeof v, "%s in %s", b->tte >= 0 ? "empty" : "full", m);
+        r_field(&T, "Time", v);
+    }
+    fans_t F;
+    if (read_fans(&F)) {
+        char fm[64];
+        fan_mode(c, &F, fm, sizeof fm);
+        v[0] = 0;
+        for (int i = 0; i < F.n; i++) { snprintf(t, sizeof t, "%s%d", i ? " · " : "", F.f[i].cur); strcat(v, t); }
+        snprintf(t, sizeof t, " rpm %s· %s", T.dim, fm);
+        strcat(v, t);
+        r_field(&T, F.n > 1 ? "Fans" : "Fan", v);
+    }
+    const char *svc = service_state();
+    snprintf(v, sizeof v, "%s● %s%s", !strcmp(svc, "active") ? T.ok : T.bad, svc, T.value);
+    if (strcmp(source, "live")) { snprintf(t, sizeof t, " %s· %s", T.dim, source); strcat(v, t); }
+    r_field(&T, "Service", v);
+    if (conf_app) {
+        snprintf(l, sizeof l, " %s! %s manages charging - macbat stays hands-off%s", T.warn, conf_app, T.reset);
+        r_line(&T, l);
+    }
+    r_bot(&T);
 }
 
 static int cmd_status(bool json) {
@@ -1713,8 +2036,9 @@ static int cmd_status(bool json) {
         printf("}\n");
         return 0;
     }
-    if (use_retro()) {
-        status_retro(&c, &b, &cp, &s, have, source, model, conf_app, mode);
+    if (use_boxed()) {
+        if (theme().retro) status_retro(&c, &b, &cp, &s, have, source, model, conf_app, mode);
+        else status_modern(&c, &b, &cp, &s, have, source, model, conf_app, mode);
         return 0;
     }
     bool utf = utf8_out();
@@ -1784,9 +2108,9 @@ static int cmd_status(bool json) {
 /* ------------------------------------------------------------------ fan page (macbat fan) */
 static void fan_retro(const conf_t *c, const fans_t *F, const char *fm, double temp, const char *model) {
     theme_t T = theme();
-    char l[1024], r[256], v[512], t[96];
+    char l[4096], r[256], v[1024], t[96];
     const int GW = 26;
-    r_rule(&T, "╔", "═", "╗");
+    r_top(&T);
     snprintf(l, sizeof l, "%s█▒░ M A C B A T ░▒█%s  %sFANS%s", T.title, T.reset, T.label, T.reset);
     snprintf(r, sizeof r, "%sv%s · %s%s", T.dim, MACBAT_VERSION, model, T.reset);
     r_split(&T, l, r);
@@ -1798,7 +2122,7 @@ static void fan_retro(const conf_t *c, const fans_t *F, const char *fm, double t
     snprintf(l, sizeof l, "%s%s%s", T.label, pn, T.reset);
     snprintf(r, sizeof r, "%s%s%s", T.dim, ts, T.reset);
     r_split(&T, l, r);
-    r_rule(&T, "╠", "═", "╣");
+    r_sep(&T);
     for (int i = 0; i < F->n; i++) {
         const fan_t *f = &F->f[i];
         if (i) r_line(&T, "");
@@ -1813,7 +2137,7 @@ static void fan_retro(const conf_t *c, const fans_t *F, const char *fm, double t
         upcase(lab);
         snprintf(rpm, sizeof rpm, "%d", f->cur < 0 ? 0 : f->cur);
         for (int row = 0; row < 5; row++) {
-            char g[1024] = "", dg[256];
+            char g[2048] = "", dg[256];
             if (row >= 1 && row <= 3) {
                 strcat(g, T.frame);
                 strcat(g, row == 1 ? "┌" : row == 2 ? "│" : "└");
@@ -1838,7 +2162,7 @@ static void fan_retro(const conf_t *c, const fans_t *F, const char *fm, double t
             r_line(&T, l);
         }
     }
-    r_rule(&T, "╟", "─", "╢");
+    r_sep2(&T);
     char fmu[64];
     snprintf(fmu, sizeof fmu, "%s", fm);
     upcase(fmu);
@@ -1867,7 +2191,60 @@ static void fan_retro(const conf_t *c, const fans_t *F, const char *fm, double t
     r_field(&T, "SETTING", v);
     snprintf(l, sizeof l, "%ssudo macbat fan set <rpm|NN%%>  ·  sudo macbat fan auto%s", T.dim, T.reset);
     r_line(&T, l);
-    r_rule(&T, "╚", "═", "╝");
+    r_bot(&T);
+}
+
+static void fan_modern(const conf_t *c, const fans_t *F, const char *fm, double temp, const char *model) {
+    theme_t T = theme();
+    char l[4096], v[1024], t[160], bar[3072];
+    const int BW = RW - 4;
+    hdr_modern(&T, "fans", model);
+    for (int i = 0; i < F->n; i++) {
+        const fan_t *f = &F->f[i];
+        r_line(&T, "");
+        int mx = f->max > 0 ? f->max : 1;
+        int mark = f->min > 0 ? clampi((int)iround((double)f->min / mx * BW), 0, BW - 1) : -1;
+        double frac = fan_limits_ok(f) ? (double)(f->cur - f->min) / (f->max - f->min) : 0;
+        const char *lvl = frac < 0.5 ? T.ok : frac < 0.8 ? T.warn : T.bad;
+        char lab[48], r[64];
+        if (!strncmp(f->label, "Fan ", 4)) snprintf(lab, sizeof lab, "Fan %d", i + 1);
+        else snprintf(lab, sizeof lab, "Fan %d · %s", i + 1, f->label);
+        snprintf(l, sizeof l, " %s%s%s", T.label, lab, T.reset);
+        snprintf(r, sizeof r, "%s%d rpm%s ", lvl, f->cur < 0 ? 0 : f->cur, T.reset);
+        r_split(&T, l, r);
+        m_bar(&T, (double)(f->cur < 0 ? 0 : f->cur) / mx, mark, BW, lvl, frac < 0.5, bar, sizeof bar);
+        snprintf(l, sizeof l, " %s", bar);
+        r_line(&T, l);
+        snprintf(t, sizeof t, "min %d", f->min);
+        snprintf(r, sizeof r, "max %d ", f->max);
+        m_caption(&T, 1, mark, t, r);
+    }
+    r_sep(&T);
+    snprintf(v, sizeof v, "%s%s", strncmp(fm, "manual", 6) ? "" : T.hi, fm);
+    r_field(&T, "Mode", v);
+    v[0] = 0;
+    for (int i = 0; i < F->n; i++) { snprintf(t, sizeof t, "%s%d-%d", i ? " · " : "", F->f[i].min, F->f[i].max); strcat(v, t); }
+    strcat(v, " rpm");
+    r_field(&T, "Range", v);
+    v[0] = 0;
+    for (int i = 0; i < F->n; i++) { snprintf(t, sizeof t, "%s%d", i ? " · " : "", F->f[i].target); strcat(v, t); }
+    strcat(v, " rpm");
+    r_field(&T, "Target", v);
+    if (temp > 0) {
+        snprintf(v, sizeof v, "%s%.1f °C %s· thermal guard at %d °C", temp >= FAN_HOT ? T.bad : "", temp, T.dim, FAN_HOT);
+        r_field(&T, "CPU", v);
+    }
+    char sp[32];
+    fan_spec_text(c->fan, sp, sizeof sp);
+    if (!strcmp(c->fan, "auto")) snprintf(v, sizeof v, "auto");
+    else {
+        snprintf(v, sizeof v, "%s %s· %s", sp, T.dim, svc_active() ? "kept by the service" : "service not running");
+        if (*c->fan_paused) { snprintf(t, sizeof t, " · %s off", c->fan_paused); strcat(v, t); }
+    }
+    r_field(&T, "Setting", v);
+    snprintf(l, sizeof l, "%ssudo macbat fan set <rpm|NN%%>  ·  sudo macbat fan auto%s", T.dim, T.reset);
+    r_line(&T, l);
+    r_bot(&T);
 }
 
 static int cmd_fan(const char *a, const char *b, bool json) {
@@ -1887,7 +2264,10 @@ static int cmd_fan(const char *a, const char *b, bool json) {
             json_str("setting", c.fan, true);
             json_str("paused_daemon", *c.fan_paused ? c.fan_paused : NULL, true);
             if (temp > 0) printf("  \"cpu_temp_c\": %.1f\n}\n", temp); else printf("  \"cpu_temp_c\": null\n}\n");
-        } else if (use_retro()) fan_retro(&c, &F, fm, temp, model);
+        } else if (use_boxed()) {
+            if (theme().retro) fan_retro(&c, &F, fm, temp, model);
+            else fan_modern(&c, &F, fm, temp, model);
+        }
         else {
             printf("macbat %s - %s - fans\n", MACBAT_VERSION, model);
             for (int i = 0; i < F.n; i++)
@@ -2350,6 +2730,25 @@ static bool s_restore(const char *t, char *m, size_t n) {
     return true;
 }
 
+/* look (both platforms) */
+static int dyn_theme(char (*o)[32], int max) {
+    int k = 0;
+    for (int i = 0; i < NTHEMES && k < max; i++) snprintf(o[k++], 32, "%s", THEMES[i].name);
+    return k;
+}
+static bool g_theme(char *o, size_t n) { if (!g_th) resolve_theme(NULL); snprintf(o, n, "%s", g_th->name); return true; }
+static bool s_theme(const char *t, char *m, size_t n) {
+    const theme_def_t *d = find_theme(t);
+    if (!d) { snprintf(m, n, "unknown theme %s", t); return false; }
+    conf_t c = load_conf();
+    snprintf(c.theme, sizeof c.theme, "%s", d->name);
+    save_conf(c);
+    g_th = d;
+    snprintf(g_th_src, sizeof g_th_src, "%s", CONF_PATH);
+    snprintf(m, n, "theme %s (saved)", d->name);
+    return true;
+}
+
 /* fans (both platforms) */
 static bool av_fans(void) { fans_t F; return read_fans(&F); }
 static int dyn_fan(char (*o)[32], int max) {
@@ -2572,6 +2971,7 @@ static const setting_t SETTINGS[] = {
     {"POWER SAVING", "CPU governor", K_OPTS, {0}, {0}, 0, 0, 0, av_gov, dyn_gov, lx_gov_get, s_gov, NULL},
     {"POWER SAVING", "CPU turbo boost", K_OPTS, {"on", "off"}, {0}, 0, 0, 0, av_turbo, NULL, lx_turbo_get, s_turbo, NULL},
     {"POWER SAVING", "PCIe ASPM", K_OPTS, {0}, {0}, 0, 0, 0, av_aspm, dyn_aspm, lx_aspm_get, s_aspm, NULL},
+    {"APPEARANCE", "Theme", K_OPTS, {0}, {0}, 0, 0, 0, av_always, dyn_theme, g_theme, s_theme, NULL},
 };
 #else /* macOS: pmset */
 static bool pm_get(const char *key, char *o, size_t n) {
@@ -2613,6 +3013,7 @@ static const setting_t SETTINGS[] = {
     {"SLEEP", "Power Nap", K_OPTS, {"1", "0"}, {"ON", "OFF"}, 0, 0, 0, av_nap, NULL, g_nap, s_nap, NULL},
     {"SLEEP", "Low power mode", K_OPTS, {"1", "0"}, {"ON", "OFF"}, 0, 0, 0, av_lpm, NULL, g_lpm, s_lpm, NULL},
     {"DISK", "Disk sleep", K_OPTS, {"0", "10", "30", "60"}, {"NEVER", "10 MIN", "30 MIN", "1 HOUR"}, 0, 0, 0, av_dks, NULL, g_dks, s_dks, NULL},
+    {"APPEARANCE", "Theme", K_OPTS, {0}, {0}, 0, 0, 0, av_always, dyn_theme, g_theme, s_theme, NULL},
 };
 #endif
 #define NSET ((int)(sizeof SETTINGS / sizeof SETTINGS[0]))
@@ -2698,6 +3099,93 @@ static void change(const setting_t *st, int dir, char *msg, size_t mn, bool *ok)
     *ok = st->set(o[idx], msg, mn);
 }
 
+/* the 3-row battery block at the top of the settings screen (and of 'macbat theme --list') */
+static void tui_gauge(const theme_t *Tp, bool hb, const battery_t *bp, const conf_t *cfg, bool have, const caps_t *cpp,
+                      const control_t *sp) {
+    const theme_t T = *Tp;
+    battery_t b = *bp;
+    conf_t c = *cfg;
+    caps_t cp = *cpp;
+    control_t s = *sp;
+    char l[4096];
+    if (!T.retro) {
+        const int BW = RW - 4;
+        int pct = hb && b.percent >= 0 ? b.percent : 0;
+        int mark = c.limit < 100 ? clampi((int)iround(c.limit / 100.0 * BW), 0, BW - 1) : -1;
+        const char *lvl = lvl_ink(&T, pct);
+        char mb[96], md[96], e[256] = "", t[48], r[512], bar[3072];
+        snprintf(md, sizeof md, "%s", hb ? mode_text(&c, &b, have ? &cp : NULL, have ? &s : NULL, mb, sizeof mb) : "?");
+        md[strcspn(md, "(")] = 0;
+        if (*md) md[0] = a_up(md[0]);
+        if (hb && b.has_v) { snprintf(t, sizeof t, "%.2f V  ", b.voltage); strcat(e, t); }
+        if (hb && b.has_i) { snprintf(t, sizeof t, "%+.2f A  ", b.current); strcat(e, t); }
+        if (hb && b.has_p) { snprintf(t, sizeof t, "%+.1f W  ", b.power); strcat(e, t); }
+        if (hb && b.has_t) { snprintf(t, sizeof t, "%.0f °C", b.temp_c); strcat(e, t); }
+        snprintf(l, sizeof l, " %s%d%%%s  %s%s%s", lvl, pct, T.reset, T.hi, md, T.reset);
+        snprintf(r, sizeof r, "%s%s%s ", T.dim, e, T.reset);
+        r_split(&T, l, r);
+        m_bar(&T, pct / 100.0, mark, BW, lvl, pct >= 20, bar, sizeof bar);
+        snprintf(l, sizeof l, " %s", bar);
+        r_line(&T, l);
+        const char *svc = service_state();
+        char hs[64];
+        if (hb && b.health_unreliable) snprintf(hs, sizeof hs, "health n/a");
+        else if (hb && b.health >= 0) snprintf(hs, sizeof hs, "health %.0f%%", b.health);
+        else snprintf(hs, sizeof hs, "health ?");
+        snprintf(l, sizeof l, " %s● %s%s %s· %s%s", !strcmp(svc, "active") ? T.ok : T.bad,
+                 !strcmp(svc, "active") ? "service on" : "service off", T.reset, T.dim, hs, T.reset);
+        snprintf(r, sizeof r, "%slimit %d%%%s ", T.dim, c.limit, T.reset);
+        r_split(&T, l, r);
+        return;
+    }
+    /* compact gauge + live readings */
+    const int GW = 20;
+    int pct = hb && b.percent >= 0 ? b.percent : 0;
+    int fill = (int)iround(pct / 100.0 * GW), mark = c.limit < 100 ? (int)iround(c.limit / 100.0 * GW) : -1;
+    if (mark >= GW) mark = GW - 1;
+    const char *lvl = pct >= 50 ? T.ok : pct >= 20 ? T.hi : T.bad;
+    char mb[96];
+    const char *mode = hb ? mode_text(&c, &b, have ? &cp : NULL, have ? &s : NULL, mb, sizeof mb) : "?";
+    for (int row = 0; row < 3; row++) {
+        char g[2048];
+        snprintf(g, sizeof g, "%s%s", T.frame, row == 0 ? "┌" : row == 1 ? "│" : "└");
+        for (int i = 0; i < GW; i++) {
+            if (row == 1) {
+                strcat(g, i < fill ? ((mark >= 0 && i >= mark) ? T.hi : lvl) : T.dim);
+                strcat(g, i < fill ? "█" : "░");
+                strcat(g, T.frame);
+            } else strcat(g, i == mark ? (row == 0 ? "┬" : "┴") : "─");
+        }
+        strcat(g, row == 0 ? "┐ " : row == 1 ? "│█" : "┘ ");
+        strcat(g, T.reset);
+        char info[512] = "";
+        if (row == 0) {
+            char md[96];
+            snprintf(md, sizeof md, "%s", mode);
+            md[strcspn(md, "(")] = 0; /* compact header: drop the explanation in parentheses */
+            upcase(md);
+            snprintf(info, sizeof info, "%s%d%%%s  %s%s%s", lvl, pct, T.reset, T.hi, md, T.reset);
+        } else if (row == 1) {
+            char e[256] = "", t[48];
+            if (hb && b.has_v) { snprintf(t, sizeof t, "%.2fV ", b.voltage); strcat(e, t); }
+            if (hb && b.has_i) { snprintf(t, sizeof t, "%+.2fA ", b.current); strcat(e, t); }
+            if (hb && b.has_p) { snprintf(t, sizeof t, "%+.1fW ", b.power); strcat(e, t); }
+            if (hb && b.has_t) { snprintf(t, sizeof t, "%.0f°C", b.temp_c); strcat(e, t); }
+            snprintf(info, sizeof info, "%s%s%s", T.value, e, T.reset);
+        } else {
+            const char *svc = service_state();
+            char hs[64];
+            if (hb && b.health_unreliable) snprintf(hs, sizeof hs, "HEALTH N/A");
+            else if (hb && b.health >= 0) snprintf(hs, sizeof hs, "HEALTH %.0f%%", b.health);
+            else snprintf(hs, sizeof hs, "HEALTH ?");
+            snprintf(info, sizeof info, "%s● %s%s %s· %s", !strcmp(svc, "active") ? T.ok : T.bad,
+                     !strcmp(svc, "active") ? "SERVICE ON" : "SERVICE OFF", T.reset, T.dim, hs);
+        }
+        snprintf(l, sizeof l, " %s  %s", g, info);
+        r_line(&T, l);
+    }
+}
+
 static int cmd_tui(char **argv) {
     struct winsize ws;
     if (ioctl(1, TIOCGWINSZ, &ws) != 0 || ws.ws_col < RW + 2 || ws.ws_row < 20 || !utf8_out()) {
@@ -2724,8 +3212,8 @@ static int cmd_tui(char **argv) {
     bool msg_ok = true;
     snprintf(msg, sizeof msg, "%s", root ? "ready - changes apply immediately" : "read-only: press S to relaunch with sudo");
     msg_ok = root;
-    theme_t T = theme();
     for (;;) {
+        theme_t T = theme(); /* every frame: the Theme row previews live */
         ioctl(1, TIOCGWINSZ, &ws);
         int rows = ws.ws_row, viewport = rows - 12;
         if (viewport < 4) viewport = 4;
@@ -2739,59 +3227,15 @@ static int cmd_tui(char **argv) {
         char model[64];
         model_name(model, sizeof model);
         fputs("\033[H", stdout);
-        r_rule(&T, "╔", "═", "╗");
-        char l[1024], r[256];
-        snprintf(l, sizeof l, "%s█▒░ M A C B A T ░▒█%s  %sSETTINGS%s", T.title, T.reset, T.label, T.reset);
-        snprintf(r, sizeof r, "%s%s%s", root ? T.dim : T.warn, root ? model : "READ-ONLY", T.reset);
+        r_top(&T);
+        char l[4096], r[256];
+        if (T.retro) snprintf(l, sizeof l, "%s█▒░ M A C B A T ░▒█%s  %sSETTINGS%s", T.title, T.reset, T.label, T.reset);
+        else snprintf(l, sizeof l, "%smacbat%s %ssettings%s", T.title, T.reset, T.dim, T.reset);
+        snprintf(r, sizeof r, "%s%s%s", root ? T.dim : T.warn, root ? model : T.retro ? "READ-ONLY" : "read-only", T.reset);
         r_split(&T, l, r);
-        r_rule(&T, "╠", "═", "╣");
-        /* compact gauge + live readings */
-        const int GW = 20;
-        int pct = hb && b.percent >= 0 ? b.percent : 0;
-        int fill = (int)iround(pct / 100.0 * GW), mark = c.limit < 100 ? (int)iround(c.limit / 100.0 * GW) : -1;
-        if (mark >= GW) mark = GW - 1;
-        const char *lvl = pct >= 50 ? T.ok : pct >= 20 ? T.hi : T.bad;
-        char mb[96];
-        const char *mode = hb ? mode_text(&c, &b, have ? &cp : NULL, have ? &s : NULL, mb, sizeof mb) : "?";
-        for (int row = 0; row < 3; row++) {
-            char g[1024];
-            snprintf(g, sizeof g, "%s%s", T.frame, row == 0 ? "┌" : row == 1 ? "│" : "└");
-            for (int i = 0; i < GW; i++) {
-                if (row == 1) {
-                    strcat(g, i < fill ? ((mark >= 0 && i >= mark) ? T.hi : lvl) : T.dim);
-                    strcat(g, i < fill ? "█" : "░");
-                    strcat(g, T.frame);
-                } else strcat(g, i == mark ? (row == 0 ? "┬" : "┴") : "─");
-            }
-            strcat(g, row == 0 ? "┐ " : row == 1 ? "│█" : "┘ ");
-            strcat(g, T.reset);
-            char info[512] = "";
-            if (row == 0) {
-                char md[96];
-                snprintf(md, sizeof md, "%s", mode);
-                md[strcspn(md, "(")] = 0; /* compact header: drop the explanation in parentheses */
-                upcase(md);
-                snprintf(info, sizeof info, "%s%d%%%s  %s%s%s", lvl, pct, T.reset, T.hi, md, T.reset);
-            } else if (row == 1) {
-                char e[256] = "", t[48];
-                if (hb && b.has_v) { snprintf(t, sizeof t, "%.2fV ", b.voltage); strcat(e, t); }
-                if (hb && b.has_i) { snprintf(t, sizeof t, "%+.2fA ", b.current); strcat(e, t); }
-                if (hb && b.has_p) { snprintf(t, sizeof t, "%+.1fW ", b.power); strcat(e, t); }
-                if (hb && b.has_t) { snprintf(t, sizeof t, "%.0f°C", b.temp_c); strcat(e, t); }
-                snprintf(info, sizeof info, "%s%s%s", T.value, e, T.reset);
-            } else {
-                const char *svc = service_state();
-                char hs[64];
-                if (hb && b.health_unreliable) snprintf(hs, sizeof hs, "HEALTH N/A");
-                else if (hb && b.health >= 0) snprintf(hs, sizeof hs, "HEALTH %.0f%%", b.health);
-                else snprintf(hs, sizeof hs, "HEALTH ?");
-                snprintf(info, sizeof info, "%s● %s%s %s· %s", !strcmp(svc, "active") ? T.ok : T.bad,
-                         !strcmp(svc, "active") ? "SERVICE ON" : "SERVICE OFF", T.reset, T.dim, hs);
-            }
-            snprintf(l, sizeof l, " %s  %s", g, info);
-            r_line(&T, l);
-        }
-        r_rule(&T, "╟", "─", "╢");
+        r_sep(&T);
+        tui_gauge(&T, hb, &b, &c, have, &cp, &s);
+        r_sep2(&T);
         /* list with section headers */
         int lines[64], kind[64], nl = 0, selline = 0;
         const char *last = NULL;
@@ -2809,7 +3253,10 @@ static int cmd_tui(char **argv) {
             if (li >= nl) { r_line(&T, ""); continue; }
             const setting_t *st = &SETTINGS[lines[li]];
             if (kind[li] == 1) {
-                snprintf(l, sizeof l, "%s── %s %s", T.dim, st->section, T.reset);
+                char sec[32];
+                snprintf(sec, sizeof sec, "%s", st->section);
+                if (T.retro) snprintf(l, sizeof l, "%s── %s %s", T.dim, sec, T.reset);
+                else { title_case(sec); snprintf(l, sizeof l, "%s%s%s", T.title, sec, T.reset); }
                 r_line(&T, l);
                 continue;
             }
@@ -2820,22 +3267,23 @@ static int cmd_tui(char **argv) {
             }
             char dots[80] = "";
             int dl = 30 - (int)strlen(st->label);
-            for (int d = 0; d < dl; d++) strcat(dots, "·");
+            for (int d = 0; d < dl; d++) strcat(dots, T.retro ? "·" : " ");
             bool on = li == selline;
+            if (!T.retro) soft_case(val);
             if (on)
-                snprintf(l, sizeof l, "%s▸ %s %s%s %s«%s %s %s»%s", T.hi, st->label, T.dim, dots, T.hi,
-                         "\033[7m", val, "\033[27m", T.reset);
+                snprintf(l, sizeof l, "%s%s %s %s%s %s%s%s %s %s%s%s", T.hi, T.retro ? "▸" : "›", st->label, T.dim, dots, T.hi,
+                         T.retro ? "«" : "‹", "\033[7m", val, "\033[27m", T.retro ? "»" : "›", T.reset);
             else
                 snprintf(l, sizeof l, "  %s%s %s%s %s  %s%s", T.label, st->label, T.dim, dots, T.value, val, T.reset);
             r_line(&T, l);
         }
-        r_rule(&T, "╟", "─", "╢");
+        r_sep2(&T);
         snprintf(l, sizeof l, "%s%s%s", msg_ok ? T.ok : T.warn, msg, T.reset);
         r_line(&T, l);
         snprintf(l, sizeof l, "%s↑↓ select  ←→ change  ENTER apply/run  %sQ quit%s", T.dim,
                  root ? "R refresh  " : "S sudo  ", T.reset);
         r_line(&T, l);
-        r_rule(&T, "╚", "═", "╝");
+        r_bot(&T);
         fputs("\033[J", stdout);
         fflush(stdout);
 
@@ -2852,14 +3300,82 @@ static int cmd_tui(char **argv) {
             die("cannot relaunch with sudo");
         } else if (key == KEY_LEFT_ || key == KEY_RIGHT_ || key == 'h' || key == 'l' || key == '-' || key == '+' ||
                    key == '\r' || key == '\n' || key == ' ') {
-            if (!root) { snprintf(msg, sizeof msg, "read-only: press S to relaunch with sudo"); msg_ok = false; continue; }
             int dir = (key == KEY_LEFT_ || key == 'h' || key == '-') ? -1 : 1;
             const setting_t *st = &SETTINGS[vis[sel]];
+            if (!root && st->set == s_theme) { /* themes are only looks: preview them without sudo */
+                char o[16][32], cur[32];
+                int k = setting_opts(st, o, 16), idx = 0;
+                st->get(cur, sizeof cur);
+                for (int i = 0; i < k; i++) if (!strcmp(o[i], cur)) idx = i;
+                g_th = find_theme(o[(idx + dir + k) % k]);
+                snprintf(g_th_src, sizeof g_th_src, "preview");
+                snprintf(msg, sizeof msg, "theme %s - preview only, sudo saves it", g_th->name);
+                msg_ok = true;
+                continue;
+            }
+            if (!root) { snprintf(msg, sizeof msg, "read-only: press S to relaunch with sudo"); msg_ok = false; continue; }
             if (st->kind == K_ACTION && !(key == '\r' || key == '\n' || key == ' ')) continue;
             change(st, dir, msg, sizeof msg, &msg_ok);
         }
     }
     tui_restore();
+    return 0;
+}
+
+/* ------------------------------------------------------------------ themes command */
+static int cmd_theme(const char *a) {
+    char names[128];
+    theme_names(names, sizeof names);
+    if (!g_th) resolve_theme(NULL);
+    if (!a) {
+        printf("theme: %s (%s)\n\n", g_th->name, g_th_src);
+        for (int i = 0; i < NTHEMES; i++)
+            printf("  %s %-7s %s%s\n", &THEMES[i] == g_th ? "*" : " ", THEMES[i].name, THEMES[i].desc, i ? "" : " (default)");
+        printf("\npreview all:  macbat theme --list\nsave:         sudo macbat theme NAME   (or the settings screen)\n"
+               "just once:    macbat --theme NAME status   ·   MACBAT_THEME=NAME   ·   NO_COLOR=1 drops colour\n");
+        return 0;
+    }
+    if (!strcmp(a, "--list") || !strcmp(a, "list") || !strcmp(a, "-l")) {
+        if (!use_boxed()) {
+            for (int i = 0; i < NTHEMES; i++) printf("%-7s %s\n", THEMES[i].name, THEMES[i].desc);
+            return 0;
+        }
+        battery_t b;
+        bool hb = read_battery(&b);
+        conf_t c = load_conf();
+        caps_t cp;
+        control_t s = {-1, -1, -1};
+        long age;
+        bool have = get_caps(&cp) ? (s = get_control(&cp), true) : read_state(&cp, &s, &age);
+        const theme_def_t *cur = g_th;
+        for (int i = 0; i < NTHEMES; i++) {
+            g_th = &THEMES[i];
+            theme_t T = theme();
+            char cap[96];
+            snprintf(cap, sizeof cap, "%s%s%s", THEMES[i].name, i ? "" : " · default", &THEMES[i] == cur ? " · current" : "");
+            r_top_title(&T, cap);
+            tui_gauge(&T, hb, &b, &c, have, &cp, &s);
+            r_bot(&T);
+        }
+        g_th = cur;
+        printf("save one: sudo macbat theme NAME   ·   try one: macbat --theme NAME status\n");
+        return 0;
+    }
+    if (!strcmp(a, "default") || !strcmp(a, "reset")) {
+        need_root("theme");
+        conf_t c = load_conf();
+        c.theme[0] = 0;
+        save_conf(c);
+        printf("theme: back to the default (%s)\n", THEMES[0].name);
+        return 0;
+    }
+    const theme_def_t *d = find_theme(a);
+    if (!d) die("unknown theme '%s' - themes: %s (preview: macbat theme --list)", a, names);
+    need_root("theme");
+    conf_t c = load_conf();
+    snprintf(c.theme, sizeof c.theme, "%s", d->name);
+    save_conf(c);
+    printf("theme: %s (saved in %s)\n", d->name, CONF_PATH);
     return 0;
 }
 
@@ -2878,12 +3394,14 @@ static void usage(void) {
          "  sudo macbat fan auto          automatic fan control again (re-enables mbpfan if macbat paused it)\n"
          "  sudo macbat install           install + start the background service (systemd / launchd)\n"
          "  sudo macbat uninstall         remove the service, restore normal charging (100%)\n"
+         "  macbat theme [NAME|--list]    show / preview (--list) / save (sudo) the look: modern, mono, ocean,\n"
+         "                                candy, nord, retro, amber\n"
          "  macbat keys                   show the relevant SMC keys (diagnostics)\n"
          "  macbat --version\n"
          "\n"
-         "options: --force (ignore other charge managers such as AlDente), --quiet, --plain\n"
-         "env:     MACBAT_THEME=amber (default green), NO_COLOR=1\n"
-         "config:  " CONF_PATH "  (limit, auto_discharge, hysteresis, interval, fan)\n"
+         "options: --theme NAME, --force (ignore other charge managers such as AlDente), --quiet, --plain\n"
+         "env:     MACBAT_THEME=NAME, NO_COLOR=1, MACBAT_COLORS=16|256|truecolor (default: from TERM / COLORTERM)\n"
+         "config:  " CONF_PATH "  (limit, auto_discharge, hysteresis, interval, fan, theme)\n"
          "https://github.com/neuralfoundry-coder/macbat");
 }
 
@@ -2892,8 +3410,11 @@ int main(int argc, char **argv) {
     const char *pos[3] = {NULL, NULL, NULL};
     int np = 0;
     bool json = false;
+    const char *theme_flag = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--json")) json = true;
+        else if (!strcmp(argv[i], "--theme") && i + 1 < argc) theme_flag = argv[++i];
+        else if (!strncmp(argv[i], "--theme=", 8)) theme_flag = argv[i] + 8;
         else if (!strcmp(argv[i], "--force")) g_force = true;
         else if (!strcmp(argv[i], "--quiet")) g_quiet = true;
         else if (!strcmp(argv[i], "--plain")) g_plain = true;
@@ -2901,6 +3422,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h") || !strcmp(argv[i], "help")) { usage(); return 0; }
         else if (np < 3) pos[np++] = argv[i];
     }
+    if (theme_flag) resolve_theme(theme_flag); /* unknown names stop here, with the list */
     if (!smc_available()) die("applesmc not found - this does not look like an Intel Mac (try: sudo modprobe applesmc)");
     if (!np && !json && !g_plain && isatty(0) && isatty(1)) return cmd_tui(argv);
     const char *cmd = np ? pos[0] : "status";
@@ -2912,6 +3434,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "uninstall")) return cmd_uninstall();
     if (!strcmp(cmd, "keys")) return cmd_keys();
     if (!strcmp(cmd, "fan") || !strcmp(cmd, "fans")) return cmd_fan(pos[1], pos[2], json);
+    if (!strcmp(cmd, "theme") || !strcmp(cmd, "themes")) return cmd_theme(pos[1]);
     if (!strcmp(cmd, "daemon")) return cmd_daemon();
     usage();
     return 2;
