@@ -9,7 +9,10 @@
  * Single file, no dependencies.  Build:  make   (see Makefile)
  * SPDX-License-Identifier: MIT
  */
-#define MACBAT_VERSION "0.5.0"
+#define MACBAT_VERSION "0.6.0"
+#if defined(__linux__)
+#  define _GNU_SOURCE /* struct ucred (SO_PEERCRED) */
+#endif
 
 #include <ctype.h>
 #include <errno.h>
@@ -31,6 +34,11 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/select.h>
+#include <pwd.h>
+#include <grp.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -225,6 +233,8 @@ typedef struct {
     char fan_paused[32];   /* fan daemon (mbpfan) that macbat stopped for a manual speed */
     bool fan_paused_enabled;
     char theme[16];        /* look of the status / settings screens; empty = default (modern) */
+    bool topup;            /* charge to 100% once, then back to the limit (cleared by the service) */
+    long topup_since;
 } conf_t;
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
@@ -256,6 +266,8 @@ static conf_t load_conf(void) {
             CS(fan); CS(fan_paused); CS(theme);
 #undef CS
             else if (!strcmp(k, "fan_paused_enabled")) c.fan_paused_enabled = !strcasecmp(v, "on");
+            else if (!strcmp(k, "topup")) c.topup = !strcasecmp(v, "on");
+            else if (!strcmp(k, "topup_since")) c.topup_since = atol(v);
             else if (!strcmp(k, "screen_blank")) c.screen_blank = *v ? atoi(v) : -1;
             else if (!strcmp(k, "auto_discharge"))
                 c.auto_discharge = !strcasecmp(v, "on") || !strcasecmp(v, "1") || !strcasecmp(v, "yes") || !strcasecmp(v, "true");
@@ -282,6 +294,7 @@ static void save_conf(conf_t c) {
     snprintf(t, sizeof t, "fan=%s\n", c.fan);
     strcat(b, t);
     if (*c.theme) { snprintf(t, sizeof t, "theme=%s\n", c.theme); strcat(b, t); }
+    if (c.topup) { snprintf(t, sizeof t, "topup=on\ntopup_since=%ld\n", c.topup_since); strcat(b, t); }
     if (*c.fan_paused) {
         snprintf(t, sizeof t, "fan_paused=%s\nfan_paused_enabled=%s\n", c.fan_paused, c.fan_paused_enabled ? "on" : "off");
         strcat(b, t);
@@ -1189,7 +1202,7 @@ static const char *platform_name(void) { return apple_silicon() ? "macOS · Appl
 
 /* ------------------------------------------------------------------ control loop */
 static int plan(const conf_t *c, const battery_t *b, const control_t *s, const caps_t *cp, wr_t *w) {
-    int n = 0, pct = b->percent, limit = c->limit;
+    int n = 0, pct = b->percent, limit = c->topup ? 100 : c->limit; /* top-up: charge to 100% once */
     if (pct < 0) return 0;
     bool floor = pct <= SAFETY_FLOOR;
     if (cp->hw_limit && s->hw_limit != limit) n += w_hw_limit(w + n, limit);
@@ -1307,6 +1320,15 @@ static void pm_callback(void *refcon, io_service_t svc, natural_t msg, void *arg
 }
 #endif
 
+#ifdef OS_LINUX
+#  define CTL_PATH "/run/macbat.sock"
+#else
+#  define CTL_PATH "/var/run/macbat.sock"
+static void ctl_cf_cb(CFFileDescriptorRef f, CFOptionFlags fl, void *info);
+#endif
+static int ctl_open(void);
+static void ctl_serve(int lfd);
+
 static int cmd_daemon(void) {
     need_root("daemon");
     refuse_if_conflict("daemon");
@@ -1322,6 +1344,8 @@ static int cmd_daemon(void) {
     sigaction(SIGINT, &sa, NULL);
     sa.sa_handler = on_hup;
     sigaction(SIGHUP, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN); /* a control client may go away before the reply */
+    int lfd = ctl_open();
     bool can_sleep_hook = true;
 #ifdef OS_MAC
     IONotificationPortRef port = NULL;
@@ -1329,6 +1353,12 @@ static int cmd_daemon(void) {
     g_pm_root = IORegisterForSystemPower(NULL, &port, pm_callback, &notifier);
     if (g_pm_root) CFRunLoopAddSource(CFRunLoopGetCurrent(), IONotificationPortGetRunLoopSource(port), kCFRunLoopDefaultMode);
     else { can_sleep_hook = false; logmsg("warning: no sleep notifications; auto-discharge disabled"); }
+    if (lfd >= 0) {
+        CFFileDescriptorRef cff = CFFileDescriptorCreate(NULL, lfd, false, ctl_cf_cb, NULL);
+        CFFileDescriptorEnableCallBacks(cff, kCFFileDescriptorReadCallBack);
+        CFRunLoopSourceRef src = CFFileDescriptorCreateRunLoopSource(NULL, cff, 0);
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), src, kCFRunLoopDefaultMode);
+    }
 #endif
     time_t last_mtime = -1;
     time_t next = 0;
@@ -1346,6 +1376,14 @@ static int cmd_daemon(void) {
             if (!can_sleep_hook) c.auto_discharge = false;
             battery_t b;
             if (read_battery(&b)) {
+                /* "full" alone is not enough: the gauge also says full while the SMC holds the battery at the limit */
+                long tu = time(NULL) - c.topup_since;
+                bool done = b.percent >= 100 || (b.percent >= 97 && !strcmp(b.state, "full") && tu > 600);
+                if (c.topup && (done || tu > 12 * 3600)) {
+                    logmsg("top-up %s - back to the %d%% limit", done ? "done" : "expired", c.limit);
+                    c.topup = false;
+                    save_conf(c);
+                }
                 control_t s = get_control(&g_dcaps);
                 wr_t w[8];
                 int n = plan(&c, &b, &s, &g_dcaps, w);
@@ -1362,11 +1400,16 @@ static int cmd_daemon(void) {
             next = time(NULL) + c.interval;
         }
 #ifdef OS_MAC
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 2.0, false);
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 2.0, false); /* the control socket stops it early */
 #else
-        sleep(2);
+        fd_set rf;
+        FD_ZERO(&rf);
+        if (lfd >= 0) FD_SET(lfd, &rf);
+        struct timeval tv = {2, 0};
+        if (select(lfd >= 0 ? lfd + 1 : 0, &rf, NULL, NULL, &tv) > 0 && lfd >= 0 && FD_ISSET(lfd, &rf)) ctl_serve(lfd);
 #endif
     }
+    if (lfd >= 0) { close(lfd); unlink(CTL_PATH); }
     daemon_restore("stopping");
     logmsg("stopped");
     return 0;
@@ -1400,6 +1443,7 @@ static void fmt_min(int m, char *b, size_t n) { if (m < 0) snprintf(b, n, "-"); 
 
 static const char *mode_text(const conf_t *c, const battery_t *b, const caps_t *cp, const control_t *s, char *buf, size_t n) {
     if (s && s->adapter_off == 1) { snprintf(buf, n, "discharging to %d%% (adapter bypassed)", c->limit); return buf; }
+    if (c->topup && b->percent < 100) return "topping up to 100% (once)";
     if (s && s->charging_blocked == 1) return "holding at limit (charging paused)";
     if (b->ac == 1 && cp && cp->hw_limit && s && s->hw_limit > 0 && b->percent >= s->hw_limit && strcmp(b->state, "charging"))
         return "holding at limit (hardware)";
@@ -1998,10 +2042,12 @@ static int cmd_status(bool json) {
     if (json) {
         printf("{\n");
         json_str("version", MACBAT_VERSION, true);
+        if (!g_th) resolve_theme(NULL);
+        json_str("theme", g_th->name, true);
         json_str("platform", platform_name(), true);
         json_str("model", model, true);
-        printf("  \"conf\": {\"limit\": %d, \"auto_discharge\": %s, \"hysteresis\": %d, \"interval\": %d},\n",
-               c.limit, c.auto_discharge ? "true" : "false", c.hysteresis, c.interval);
+        printf("  \"conf\": {\"limit\": %d, \"auto_discharge\": %s, \"hysteresis\": %d, \"interval\": %d, \"topup\": %s},\n",
+               c.limit, c.auto_discharge ? "true" : "false", c.hysteresis, c.interval, c.topup ? "true" : "false");
         printf("  \"battery\": {\"percent\": %d, \"state\": \"%s\", \"ac\": %s, ", b.percent, b.state,
                b.ac < 0 ? "null" : b.ac ? "true" : "false");
         if (b.has_v) printf("\"voltage\": %.3f, ", b.voltage); else printf("\"voltage\": null, ");
@@ -2447,6 +2493,7 @@ static int cmd_uninstall(void) {
     unlink(LAUNCHD_PLIST);
 #endif
     unlink(STATE_PATH);
+    unlink(CTL_PATH);
     conf_t fc = load_conf();
     if (strcmp(fc.fan, "auto") || *fc.fan_paused) {
         char m[256];
@@ -2716,6 +2763,17 @@ static bool s_dis(const char *t, char *m, size_t n) {
     return true;
 }
 static bool g_act(char *o, size_t n) { snprintf(o, n, "run"); return true; }
+static bool s_topup(const char *t, char *m, size_t n) {
+    if (conflict() && !g_force) { snprintf(m, n, "%s manages charging here - not changed", conflict()); return false; }
+    conf_t c = load_conf();
+    c.topup = !strcmp(t, "on");
+    c.topup_since = (long)time(NULL);
+    save_conf(c);
+    if (c.topup) snprintf(m, n, "top-up: charging to 100%% once, then back to the %d%% limit%s", c.limit,
+                          svc_active() ? "" : " (needs the service)");
+    else snprintf(m, n, "top-up cancelled - limit %d%% again", c.limit);
+    return true;
+}
 static bool s_restore(const char *t, char *m, size_t n) {
     (void)t;
     if (conflict() && !g_force) { snprintf(m, n, "%s manages charging here - not touched", conflict()); return false; }
@@ -3001,6 +3059,7 @@ PM(ssl, "sleep", "system sleep (min)")
 PM(dks, "disksleep", "disk sleep (min)")
 PM(nap, "powernap", "power nap")
 PM(lpm, "lowpowermode", "low power mode")
+PM(pwm, "powermode", "energy mode (0 automatic, 1 low power, 2 high power)")
 static const setting_t SETTINGS[] = {
     {"BATTERY", "Charge limit", K_NUM, {0}, {0}, 20, 100, 5, av_always, NULL, g_limit, s_limit, NULL},
     {"BATTERY", "Auto-discharge above limit", K_OPTS, {"on", "off"}, {0}, 0, 0, 0, av_always, NULL, g_dis, s_dis, NULL},
@@ -3012,11 +3071,210 @@ static const setting_t SETTINGS[] = {
      0, 0, 0, av_ssl, NULL, g_ssl, s_ssl, NULL},
     {"SLEEP", "Power Nap", K_OPTS, {"1", "0"}, {"ON", "OFF"}, 0, 0, 0, av_nap, NULL, g_nap, s_nap, NULL},
     {"SLEEP", "Low power mode", K_OPTS, {"1", "0"}, {"ON", "OFF"}, 0, 0, 0, av_lpm, NULL, g_lpm, s_lpm, NULL},
+    {"SLEEP", "Energy mode", K_OPTS, {"0", "1", "2"}, {"AUTOMATIC", "LOW POWER", "HIGH POWER"}, 0, 0, 0, av_pwm, NULL, g_pwm, s_pwm, NULL},
     {"DISK", "Disk sleep", K_OPTS, {"0", "10", "30", "60"}, {"NEVER", "10 MIN", "30 MIN", "1 HOUR"}, 0, 0, 0, av_dks, NULL, g_dks, s_dks, NULL},
     {"APPEARANCE", "Theme", K_OPTS, {0}, {0}, 0, 0, 0, av_always, dyn_theme, g_theme, s_theme, NULL},
 };
 #endif
 #define NSET ((int)(sizeof SETTINGS / sizeof SETTINGS[0]))
+/* ------------------------------------------------------------------ control socket (service) */
+/* Lets the menu bar app - or any admin - change settings while the service runs, without a password prompt.
+ * The socket is created root-owned, mode 0660, group admin (macOS) / sudo, admin or wheel (Linux); every
+ * connection's peer credentials are checked again: root, or a member of that group who on macOS must also be
+ * the user logged in at the screen. One line in ("limit 80"), one line out ("ok ..." / "err ..."); only the
+ * requests below, every value validated; each request is logged. */
+static const char *CTL_GROUPS[] = {"admin", "sudo", "wheel"};
+
+#ifdef OS_LINUX
+/* static binary: no NSS (getpwuid / getgrnam need glibc's shared libraries) - read the local files directly */
+static bool lx_user(uid_t uid, char *name, size_t nn, gid_t *gid) {
+    FILE *f = fopen("/etc/passwd", "r");
+    char line[512];
+    bool found = false;
+    while (f && !found && fgets(line, sizeof line, f)) {
+        char *fld[4] = {0}, *p = line;
+        for (int i = 0; i < 4 && p; i++) { fld[i] = p; p = strchr(p, ':'); if (p) *p++ = 0; }
+        if (fld[3] && (uid_t)atol(fld[2]) == uid) { snprintf(name, nn, "%s", fld[0]); *gid = (gid_t)atol(fld[3]); found = true; }
+    }
+    if (f) fclose(f);
+    return found;
+}
+/* gid of group `grp` (-1 if missing); *member: user is listed in it or has it as primary group */
+static long lx_group(const char *grp, const char *user, gid_t primary, bool *member) {
+    FILE *f = fopen("/etc/group", "r");
+    char line[2048];
+    long gid = -1;
+    *member = false;
+    while (f && gid < 0 && fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\n")] = 0;
+        char *fld[4] = {0}, *p = line;
+        for (int i = 0; i < 4 && p; i++) { fld[i] = p; p = (i < 3) ? strchr(p, ':') : NULL; if (p) *p++ = 0; }
+        if (!fld[2] || strcmp(fld[0], grp)) continue;
+        gid = atol(fld[2]);
+        if (user && (gid_t)gid == primary) *member = true;
+        for (char *u = fld[3] ? strtok(fld[3], ",") : NULL; u && user; u = strtok(NULL, ",")) if (!strcmp(u, user)) *member = true;
+    }
+    if (f) fclose(f);
+    return gid;
+}
+#endif
+
+static gid_t ctl_gid(void) {
+    for (size_t i = 0; i < sizeof CTL_GROUPS / sizeof CTL_GROUPS[0]; i++) {
+#ifdef OS_LINUX
+        bool m;
+        long g = lx_group(CTL_GROUPS[i], NULL, 0, &m);
+        if (g >= 0) return (gid_t)g;
+#else
+        struct group *g = getgrnam(CTL_GROUPS[i]);
+        if (g) return g->gr_gid;
+#endif
+    }
+    return 0;
+}
+
+static bool ctl_peer_ok(int fd, char *who, size_t wn) {
+    uid_t uid;
+#ifdef OS_LINUX
+    struct ucred cr;
+    socklen_t l = sizeof cr;
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &l) != 0) return false;
+    uid = cr.uid;
+    char name[64];
+    gid_t prim;
+    if (!lx_user(uid, name, sizeof name, &prim)) { snprintf(who, wn, "uid %u", (unsigned)uid); return uid == 0; }
+    snprintf(who, wn, "%s", name);
+    if (uid == 0) return true;
+    for (size_t k = 0; k < sizeof CTL_GROUPS / sizeof CTL_GROUPS[0]; k++) {
+        bool m;
+        if (lx_group(CTL_GROUPS[k], name, prim, &m) >= 0 && m) return true;
+    }
+    return false;
+#else
+    gid_t pg;
+    if (getpeereid(fd, &uid, &pg) != 0) return false;
+    struct passwd *pw = getpwuid(uid);
+    snprintf(who, wn, "%s", pw ? pw->pw_name : "?");
+    if (uid == 0) return true;
+    if (!pw) return false;
+    struct stat st;
+    if (stat("/dev/console", &st) != 0 || st.st_uid != uid) return false; /* only the user at the screen */
+    int groups[64];
+    int ng = 64;
+    if (getgrouplist(pw->pw_name, pw->pw_gid, groups, &ng) < 0) ng = 64;
+    for (int i = 0; i < ng; i++)
+        for (size_t k = 0; k < sizeof CTL_GROUPS / sizeof CTL_GROUPS[0]; k++) {
+            struct group *gr = getgrnam(CTL_GROUPS[k]);
+            if (gr && (gid_t)groups[i] == gr->gr_gid) return true;
+        }
+    return false;
+#endif
+}
+
+static int ctl_open(void) {
+    unlink(CTL_PATH);
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (s < 0) return -1;
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof a);
+    a.sun_family = AF_UNIX;
+    snprintf(a.sun_path, sizeof a.sun_path, "%s", CTL_PATH);
+    mode_t old = umask(0177); /* created 0600 root: nobody else can connect before the chown/chmod */
+    int r = bind(s, (struct sockaddr *)&a, sizeof a);
+    umask(old);
+    if (r != 0 || chown(CTL_PATH, 0, ctl_gid()) != 0 || chmod(CTL_PATH, 0660) != 0 || listen(s, 4) != 0) {
+        logmsg("control socket unavailable: %s", strerror(errno));
+        close(s);
+        unlink(CTL_PATH);
+        return -1;
+    }
+    fcntl(s, F_SETFD, FD_CLOEXEC);
+    fcntl(s, F_SETFL, fcntl(s, F_GETFL) | O_NONBLOCK);
+    return s;
+}
+
+static bool on_off(const char *v) { return v && (!strcmp(v, "on") || !strcmp(v, "off")); }
+
+static bool ctl_exec(char *line, char *m, size_t n) {
+    char *w[5] = {0};
+    int k = 0;
+    for (char *t = strtok(line, " \t\r\n"); t && k < 5; t = strtok(NULL, " \t\r\n")) w[k++] = t;
+    bool force = k && !strcmp(w[0], "force");
+    if (force) { for (int i = 0; i < 4; i++) w[i] = w[i + 1]; k--; }
+    if (k <= 0) { snprintf(m, n, "empty request"); return false; }
+    bool saved = g_force, ok = false;
+    g_force = g_force || force;
+    if (!strcmp(w[0], "ping") && k == 1) { snprintf(m, n, "macbat %s", MACBAT_VERSION); ok = true; }
+    else if (!strcmp(w[0], "limit") && k == 2) {
+        char *e;
+        long v = strtol(w[1], &e, 10);
+        if (*e || e == w[1] || v < 20 || v > 100) snprintf(m, n, "limit must be 20-100");
+        else ok = s_limit(w[1], m, n);
+    } else if (!strcmp(w[0], "discharge") && k == 2 && on_off(w[1])) ok = s_dis(w[1], m, n);
+    else if (!strcmp(w[0], "topup") && k == 2 && on_off(w[1])) ok = s_topup(w[1], m, n);
+    else if (!strcmp(w[0], "restore") && k == 1) { fans_release(); ok = s_restore("run", m, n); }
+    else if (!strcmp(w[0], "fan") && k == 2 && !strcmp(w[1], "auto")) ok = fan_apply("auto", m, n);
+    else if (!strcmp(w[0], "fan") && k == 3 && !strcmp(w[1], "set") && strcmp(w[2], "auto") && fan_spec_ok(w[2])) ok = fan_apply(w[2], m, n);
+#ifdef OS_MAC
+    else if (!strcmp(w[0], "lowpower") && k == 2 && on_off(w[1])) ok = pm_set("lowpowermode", !strcmp(w[1], "on") ? "1" : "0", m, n, "low power mode");
+    else if (!strcmp(w[0], "powermode") && k == 2 && (!strcmp(w[1], "0") || !strcmp(w[1], "1") || !strcmp(w[1], "2")))
+        ok = pm_set("powermode", w[1], m, n, "energy mode");
+#endif
+    else snprintf(m, n, "unknown request");
+    g_force = saved;
+    if (ok) g_kick = 1;
+    return ok;
+}
+
+static void ctl_serve(int lfd) {
+    for (;;) {
+        int c = accept(lfd, NULL, NULL);
+        if (c < 0) return;
+        fcntl(c, F_SETFD, FD_CLOEXEC);
+        fcntl(c, F_SETFL, fcntl(c, F_GETFL) & ~O_NONBLOCK); /* BSD: accepted sockets inherit O_NONBLOCK */
+        struct timeval tv = {2, 0};
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+        char buf[160] = "", msg[256] = "", who[64] = "?", req[160] = "";
+        bool ok = false;
+        if (!ctl_peer_ok(c, who, sizeof who)) {
+#ifdef OS_MAC
+            snprintf(msg, sizeof msg, "not allowed - only root or an admin logged in at the screen");
+#else
+            snprintf(msg, sizeof msg, "not allowed - only root or members of admin / sudo / wheel");
+#endif
+            logmsg("control: refused %s", who);
+        } else {
+            size_t got = 0;
+            while (got < sizeof buf - 1 && !memchr(buf, '\n', got)) {
+                ssize_t r = read(c, buf + got, sizeof buf - 1 - got);
+                if (r <= 0) break;
+                got += (size_t)r;
+            }
+            buf[got] = 0;
+            snprintf(req, sizeof req, "%s", buf);
+            req[strcspn(req, "\r\n")] = 0;
+            if (!memchr(buf, '\n', got)) snprintf(msg, sizeof msg, "incomplete request");
+            else ok = ctl_exec(buf, msg, sizeof msg);
+            logmsg("control: %s: '%s' -> %s%s%s", who, req, ok ? "ok" : "refused", ok ? "" : ": ", ok ? "" : msg);
+        }
+        for (char *p = msg; *p; p++) if (*p == '\n' || *p == '\r') *p = ' ';
+        char out[300];
+        snprintf(out, sizeof out, "%s %s\n", ok ? "ok" : "err", msg);
+        if (write(c, out, strlen(out)) < 0) { /* client gone: nothing to do */ }
+        close(c);
+    }
+}
+
+#ifdef OS_MAC
+static void ctl_cf_cb(CFFileDescriptorRef f, CFOptionFlags fl, void *info) {
+    (void)fl; (void)info;
+    ctl_serve(CFFileDescriptorGetNativeDescriptor(f));
+    CFFileDescriptorEnableCallBacks(f, kCFFileDescriptorReadCallBack); /* callbacks are one-shot */
+    CFRunLoopStop(CFRunLoopGetCurrent()); /* let the service loop apply the change right away */
+}
+#endif
+
 
 /* ------------------------------------------------------------------ settings screen (TUI) */
 #include <termios.h>
@@ -3322,6 +3580,16 @@ static int cmd_tui(char **argv) {
     return 0;
 }
 
+static int cmd_topup(const char *v) {
+    if (v && !on_off(v)) die("usage: sudo macbat topup [on|off]   (on: charge to 100%% once, then back to the limit)");
+    need_root("topup");
+    refuse_if_conflict("topup");
+    char m[256];
+    bool ok = s_topup(v ? v : "on", m, sizeof m);
+    printf("%s\n", m);
+    return ok ? 0 : 1;
+}
+
 /* ------------------------------------------------------------------ themes command */
 static int cmd_theme(const char *a) {
     char names[128];
@@ -3389,6 +3657,7 @@ static void usage(void) {
          "  sudo macbat limit [20-100|off] show / set the charge limit\n"
          "  sudo macbat discharge [on|off] auto-discharge (bypass the adapter) while above the limit\n"
          "  sudo macbat restore           resume charging, re-enable the adapter, fans to automatic - now\n"
+         "  sudo macbat topup [off]       charge to 100% once, then back to the limit (off: cancel)\n"
          "  macbat fan [--json|--plain]   fan speeds, limits and mode\n"
          "  sudo macbat fan set <rpm|NN%> fixed fan speed, clamped to the fan's min..max (0% = min, 100% = max)\n"
          "  sudo macbat fan auto          automatic fan control again (re-enables mbpfan if macbat paused it)\n"
@@ -3435,6 +3704,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "keys")) return cmd_keys();
     if (!strcmp(cmd, "fan") || !strcmp(cmd, "fans")) return cmd_fan(pos[1], pos[2], json);
     if (!strcmp(cmd, "theme") || !strcmp(cmd, "themes")) return cmd_theme(pos[1]);
+    if (!strcmp(cmd, "topup")) return cmd_topup(pos[1]);
     if (!strcmp(cmd, "daemon")) return cmd_daemon();
     usage();
     return 2;
