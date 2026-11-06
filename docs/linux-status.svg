@@ -1,20 +1,20 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="650" height="422" viewBox="0 0 650 422">
+<svg xmlns="http://www.w3.org/2000/svg" width="650" height="441" viewBox="0 0 650 441">
 <defs><radialGradient id="g" cx="50%" cy="45%" r="75%"><stop offset="0" stop-color="#0d1a10"/><stop offset="1" stop-color="#030604"/></radialGradient><pattern id="s" width="4" height="3" patternUnits="userSpaceOnUse"><rect width="4" height="1" fill="#000" opacity="0.22"/></pattern></defs>
-<rect width="650" height="422" rx="14" fill="url(#g)"/>
+<rect width="650" height="441" rx="14" fill="url(#g)"/>
 <g font-family="Menlo, 'DejaVu Sans Mono', Consolas, monospace" font-size="16" xml:space="preserve">
 <text x="18.0 27.6 37.2 46.8 56.4 66.0 75.6 85.2 94.8 104.4 114.0 123.6 133.2 142.8 152.4 162.0 171.6 181.2 190.8 200.4 210.0 219.6 229.2 238.8 248.4 258.0 267.6 277.2 286.8 296.4 306.0 315.6 325.2 334.8 344.4 354.0 363.6 373.2 382.8 392.4 402.0 411.6 421.2 430.8 440.4 450.0 459.6 469.2 478.8 488.4 498.0 507.6 517.2 526.8 536.4 546.0 555.6 565.2 574.8 584.4 594.0 603.6 613.2 622.8" y="33" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">╔══════════════════════════════════════════════════════════════╗</text>
 <text x="18.0" y="52" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">║</text>
 <text x="27.6" y="52" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)"> </text>
 <text x="37.2 46.8 56.4 66.0 75.6 85.2 94.8 104.4 114.0 123.6 133.2 142.8 152.4 162.0 171.6 181.2 190.8 200.4 210.0" y="52" fill="#6dff8c" font-weight="bold" style="filter:drop-shadow(0 0 3px #6dff8c)">█▒░ M A C B A T ░▒█</text>
 <text x="219.6 229.2 238.8 248.4 258.0 267.6 277.2 286.8 296.4 306.0 315.6 325.2 334.8 344.4 354.0 363.6 373.2 382.8" y="52" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">                  </text>
-<text x="392.4 402.0 411.6 421.2 430.8 440.4 450.0 459.6 469.2 478.8 488.4 498.0 507.6 517.2 526.8 536.4 546.0 555.6 565.2 574.8 584.4 594.0 603.6" y="52" fill="#2fae4a" opacity="0.55">v0.3.0 · MacBookPro12,1</text>
+<text x="392.4 402.0 411.6 421.2 430.8 440.4 450.0 459.6 469.2 478.8 488.4 498.0 507.6 517.2 526.8 536.4 546.0 555.6 565.2 574.8 584.4 594.0 603.6" y="52" fill="#2fae4a" opacity="0.55">v0.4.0 · MacBookPro12,1</text>
 <text x="613.2" y="52" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)"> </text>
 <text x="622.8" y="52" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">║</text>
 <text x="18.0" y="71" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">║</text>
 <text x="27.6" y="71" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)"> </text>
 <text x="37.2 46.8 56.4 66.0 75.6 85.2 94.8 104.4 114.0 123.6 133.2 142.8 152.4 162.0 171.6 181.2 190.8 200.4 210.0 219.6 229.2 238.8 248.4 258.0 267.6 277.2 286.8 296.4" y="71" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">LINUX · INTEL MAC (APPLESMC)</text>
 <text x="306.0 315.6 325.2 334.8 344.4 354.0 363.6 373.2 382.8 392.4 402.0 411.6 421.2 430.8 440.4 450.0 459.6 469.2 478.8 488.4 498.0 507.6 517.2 526.8" y="71" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">                        </text>
-<text x="536.4 546.0 555.6 565.2 574.8 584.4 594.0 603.6" y="71" fill="#2fae4a" opacity="0.55">04:32:45</text>
+<text x="536.4 546.0 555.6 565.2 574.8 584.4 594.0 603.6" y="71" fill="#2fae4a" opacity="0.55">08:31:23</text>
 <text x="613.2" y="71" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)"> </text>
 <text x="622.8" y="71" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">║</text>
 <text x="18.0 27.6 37.2 46.8 56.4 66.0 75.6 85.2 94.8 104.4 114.0 123.6 133.2 142.8 152.4 162.0 171.6 181.2 190.8 200.4 210.0 219.6 229.2 238.8 248.4 258.0 267.6 277.2 286.8 296.4 306.0 315.6 325.2 334.8 344.4 354.0 363.6 373.2 382.8 392.4 402.0 411.6 421.2 430.8 440.4 450.0 459.6 469.2 478.8 488.4 498.0 507.6 517.2 526.8 536.4 546.0 555.6 565.2 574.8 584.4 594.0 603.6 613.2 622.8" y="90" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">╠══════════════════════════════════════════════════════════════╣</text>
@@ -78,8 +78,8 @@
 <text x="622.8" y="185" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">║</text>
 <text x="18.0" y="204" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">║</text>
 <text x="27.6 37.2 46.8" y="204" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">   </text>
-<text x="56.4 66.0 75.6 85.2 94.8 104.4 114.0 123.6 133.2 142.8 152.4 162.0 171.6 181.2 190.8 200.4 210.0 219.6 229.2 238.8 248.4 258.0 267.6 277.2 286.8 296.4 306.0 315.6 325.2 334.8 344.4 354.0 363.6 373.2 382.8 392.4 402.0 411.6 421.2 430.8 440.4" y="204" fill="#ffd75f" font-weight="bold" style="filter:drop-shadow(0 0 3px #ffd75f)">▸ DISCHARGING TO 80% (ADAPTER BYPASSED) ▼</text>
-<text x="450.0 459.6 469.2 478.8 488.4 498.0 507.6 517.2 526.8 536.4 546.0 555.6 565.2 574.8 584.4 594.0 603.6 613.2" y="204" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">                  </text>
+<text x="56.4 66.0 75.6 85.2 94.8 104.4 114.0 123.6 133.2 142.8 152.4 162.0" y="204" fill="#ffd75f" font-weight="bold" style="filter:drop-shadow(0 0 3px #ffd75f)">▸ CHARGING ▲</text>
+<text x="171.6 181.2 190.8 200.4 210.0 219.6 229.2 238.8 248.4 258.0 267.6 277.2 286.8 296.4 306.0 315.6 325.2 334.8 344.4 354.0 363.6 373.2 382.8 392.4 402.0 411.6 421.2 430.8 440.4 450.0 459.6 469.2 478.8 488.4 498.0 507.6 517.2 526.8 536.4 546.0 555.6 565.2 574.8 584.4 594.0 603.6 613.2" y="204" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">                                               </text>
 <text x="622.8" y="204" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">║</text>
 <text x="18.0" y="223" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">║</text>
 <text x="27.6 37.2 46.8 56.4 66.0 75.6 85.2 94.8 104.4 114.0 123.6 133.2 142.8 152.4 162.0 171.6 181.2 190.8 200.4 210.0 219.6 229.2 238.8 248.4 258.0" y="223" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">                         </text>
@@ -92,8 +92,8 @@
 <text x="46.8 56.4 66.0 75.6 85.2 94.8" y="261" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">POWER </text>
 <text x="104.4 114.0 123.6 133.2" y="261" fill="#2fae4a" opacity="0.55">····</text>
 <text x="142.8" y="261" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)"> </text>
-<text x="152.4 162.0 171.6 181.2 190.8 200.4 210.0 219.6 229.2 238.8 248.4 258.0 267.6 277.2 286.8 296.4 306.0 315.6 325.2 334.8 344.4 354.0 363.6 373.2 382.8 392.4 402.0 411.6 421.2 430.8 440.4 450.0" y="261" fill="#ffd75f" font-weight="bold" style="filter:drop-shadow(0 0 3px #ffd75f)">AC BYPASSED · RUNNING ON BATTERY</text>
-<text x="459.6 469.2 478.8 488.4 498.0 507.6 517.2 526.8 536.4 546.0 555.6 565.2 574.8 584.4 594.0 603.6 613.2" y="261" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">                 </text>
+<text x="152.4 162.0 171.6 181.2 190.8 200.4 210.0 219.6 229.2 238.8 248.4 258.0" y="261" fill="#6dff8c" style="filter:drop-shadow(0 0 3px #6dff8c)">AC CONNECTED</text>
+<text x="267.6 277.2 286.8 296.4 306.0 315.6 325.2 334.8 344.4 354.0 363.6 373.2 382.8 392.4 402.0 411.6 421.2 430.8 440.4 450.0 459.6 469.2 478.8 488.4 498.0 507.6 517.2 526.8 536.4 546.0 555.6 565.2 574.8 584.4 594.0 603.6 613.2" y="261" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">                                     </text>
 <text x="622.8" y="261" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">║</text>
 <text x="18.0" y="280" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">║</text>
 <text x="27.6 37.2" y="280" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">  </text>
@@ -126,7 +126,7 @@
 <text x="46.8 56.4 66.0 75.6 85.2" y="337" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">CELL </text>
 <text x="94.8 104.4 114.0 123.6 133.2" y="337" fill="#2fae4a" opacity="0.55">·····</text>
 <text x="142.8" y="337" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)"> </text>
-<text x="152.4 162.0 171.6 181.2 190.8 200.4 210.0 219.6 229.2 238.8 248.4 258.0 267.6 277.2 286.8 296.4 306.0 315.6 325.2 334.8 344.4 354.0 363.6 373.2 382.8 392.4 402.0 411.6 421.2 430.8 440.4 450.0 459.6 469.2 478.8 488.4" y="337" fill="#6dff8c" style="filter:drop-shadow(0 0 3px #6dff8c)">11.80 V · -1.46 A · -17.2 W · 28.0°C</text>
+<text x="152.4 162.0 171.6 181.2 190.8 200.4 210.0 219.6 229.2 238.8 248.4 258.0 267.6 277.2 286.8 296.4 306.0 315.6 325.2 334.8 344.4 354.0 363.6 373.2 382.8 392.4 402.0 411.6 421.2 430.8 440.4 450.0 459.6 469.2 478.8 488.4" y="337" fill="#6dff8c" style="filter:drop-shadow(0 0 3px #6dff8c)">12.39 V · +1.54 A · +19.1 W · 28.0°C</text>
 <text x="498.0 507.6 517.2 526.8 536.4 546.0 555.6 565.2 574.8 584.4 594.0 603.6 613.2" y="337" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">             </text>
 <text x="622.8" y="337" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">║</text>
 <text x="18.0" y="356" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">║</text>
@@ -134,20 +134,29 @@
 <text x="46.8 56.4 66.0 75.6 85.2" y="356" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">TIME </text>
 <text x="94.8 104.4 114.0 123.6 133.2" y="356" fill="#2fae4a" opacity="0.55">·····</text>
 <text x="142.8" y="356" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)"> </text>
-<text x="152.4 162.0 171.6 181.2 190.8 200.4 210.0 219.6 229.2 238.8 248.4 258.0 267.6 277.2" y="356" fill="#6dff8c" style="filter:drop-shadow(0 0 3px #6dff8c)">EMPTY IN 3h46m</text>
-<text x="286.8 296.4 306.0 315.6 325.2 334.8 344.4 354.0 363.6 373.2 382.8 392.4 402.0 411.6 421.2 430.8 440.4 450.0 459.6 469.2 478.8 488.4 498.0 507.6 517.2 526.8 536.4 546.0 555.6 565.2 574.8 584.4 594.0 603.6 613.2" y="356" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">                                   </text>
+<text x="152.4 162.0 171.6 181.2 190.8 200.4 210.0 219.6 229.2 238.8 248.4 258.0 267.6" y="356" fill="#6dff8c" style="filter:drop-shadow(0 0 3px #6dff8c)">FULL IN 0h57m</text>
+<text x="277.2 286.8 296.4 306.0 315.6 325.2 334.8 344.4 354.0 363.6 373.2 382.8 392.4 402.0 411.6 421.2 430.8 440.4 450.0 459.6 469.2 478.8 488.4 498.0 507.6 517.2 526.8 536.4 546.0 555.6 565.2 574.8 584.4 594.0 603.6 613.2" y="356" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">                                    </text>
 <text x="622.8" y="356" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">║</text>
 <text x="18.0" y="375" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">║</text>
 <text x="27.6 37.2" y="375" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">  </text>
-<text x="46.8 56.4 66.0 75.6 85.2 94.8 104.4 114.0" y="375" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">SERVICE </text>
-<text x="123.6 133.2" y="375" fill="#2fae4a" opacity="0.55">··</text>
+<text x="46.8 56.4 66.0 75.6" y="375" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">FAN </text>
+<text x="85.2 94.8 104.4 114.0 123.6 133.2" y="375" fill="#2fae4a" opacity="0.55">······</text>
 <text x="142.8" y="375" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)"> </text>
-<text x="152.4 162.0 171.6 181.2 190.8 200.4 210.0 219.6" y="375" fill="#6dff8c" font-weight="bold" style="filter:drop-shadow(0 0 3px #6dff8c)">● ACTIVE</text>
-<text x="229.2" y="375" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)"> </text>
-<text x="238.8 248.4 258.0 267.6 277.2 286.8 296.4 306.0 315.6 325.2 334.8 344.4 354.0 363.6 373.2 382.8 392.4" y="375" fill="#2fae4a" opacity="0.55">· daemon, 11s ago</text>
-<text x="402.0 411.6 421.2 430.8 440.4 450.0 459.6 469.2 478.8 488.4 498.0 507.6 517.2 526.8 536.4 546.0 555.6 565.2 574.8 584.4 594.0 603.6 613.2" y="375" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">                       </text>
+<text x="152.4 162.0 171.6 181.2 190.8 200.4 210.0 219.6 229.2" y="375" fill="#6dff8c" style="filter:drop-shadow(0 0 3px #6dff8c)">1312 RPM </text>
+<text x="238.8 248.4 258.0 267.6 277.2 286.8 296.4 306.0 315.6 325.2 334.8 344.4 354.0 363.6 373.2" y="375" fill="#2fae4a" opacity="0.55">· AUTO (MBPFAN)</text>
+<text x="382.8 392.4 402.0 411.6 421.2 430.8 440.4 450.0 459.6 469.2 478.8 488.4 498.0 507.6 517.2 526.8 536.4 546.0 555.6 565.2 574.8 584.4 594.0 603.6 613.2" y="375" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">                         </text>
 <text x="622.8" y="375" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">║</text>
-<text x="18.0 27.6 37.2 46.8 56.4 66.0 75.6 85.2 94.8 104.4 114.0 123.6 133.2 142.8 152.4 162.0 171.6 181.2 190.8 200.4 210.0 219.6 229.2 238.8 248.4 258.0 267.6 277.2 286.8 296.4 306.0 315.6 325.2 334.8 344.4 354.0 363.6 373.2 382.8 392.4 402.0 411.6 421.2 430.8 440.4 450.0 459.6 469.2 478.8 488.4 498.0 507.6 517.2 526.8 536.4 546.0 555.6 565.2 574.8 584.4 594.0 603.6 613.2 622.8" y="394" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">╚══════════════════════════════════════════════════════════════╝</text>
+<text x="18.0" y="394" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">║</text>
+<text x="27.6 37.2" y="394" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">  </text>
+<text x="46.8 56.4 66.0 75.6 85.2 94.8 104.4 114.0" y="394" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">SERVICE </text>
+<text x="123.6 133.2" y="394" fill="#2fae4a" opacity="0.55">··</text>
+<text x="142.8" y="394" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)"> </text>
+<text x="152.4 162.0 171.6 181.2 190.8 200.4 210.0 219.6" y="394" fill="#6dff8c" font-weight="bold" style="filter:drop-shadow(0 0 3px #6dff8c)">● ACTIVE</text>
+<text x="229.2" y="394" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)"> </text>
+<text x="238.8 248.4 258.0 267.6 277.2 286.8 296.4 306.0 315.6 325.2 334.8 344.4 354.0 363.6 373.2 382.8 392.4" y="394" fill="#2fae4a" opacity="0.55">· daemon, 16s ago</text>
+<text x="402.0 411.6 421.2 430.8 440.4 450.0 459.6 469.2 478.8 488.4 498.0 507.6 517.2 526.8 536.4 546.0 555.6 565.2 574.8 584.4 594.0 603.6 613.2" y="394" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">                       </text>
+<text x="622.8" y="394" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">║</text>
+<text x="18.0 27.6 37.2 46.8 56.4 66.0 75.6 85.2 94.8 104.4 114.0 123.6 133.2 142.8 152.4 162.0 171.6 181.2 190.8 200.4 210.0 219.6 229.2 238.8 248.4 258.0 267.6 277.2 286.8 296.4 306.0 315.6 325.2 334.8 344.4 354.0 363.6 373.2 382.8 392.4 402.0 411.6 421.2 430.8 440.4 450.0 459.6 469.2 478.8 488.4 498.0 507.6 517.2 526.8 536.4 546.0 555.6 565.2 574.8 584.4 594.0 603.6 613.2 622.8" y="413" fill="#2fae4a" style="filter:drop-shadow(0 0 3px #2fae4a)">╚══════════════════════════════════════════════════════════════╝</text>
 </g>
-<rect width="650" height="422" rx="14" fill="url(#s)"/>
+<rect width="650" height="441" rx="14" fill="url(#s)"/>
 </svg>
